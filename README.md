@@ -4,6 +4,22 @@ Race-by-race Formula 1 telemetry analytics and ML. Where drivers brake, where th
 
 Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), FastAPI, scikit-learn, Plotly and Streamlit.
 
+## Live demo
+
+**[TODO: paste your Streamlit Community Cloud URL here, e.g. https://f1-intel.streamlit.app]**
+
+## Screenshots
+
+| Braking zones | Head to head |
+|---|---|
+| ![Braking zones](docs/img/braking.png) | ![Head to head](docs/img/head_to_head.png) |
+
+| Track dominance | Strategy simulator |
+|---|---|
+| ![Track dominance](docs/img/dominance.png) | ![Strategy simulator](docs/img/strategy.png) |
+
+*(placeholders above — swap in real captures from your deployed dashboard)*
+
 ## Features
 
 | Module | What it answers |
@@ -31,6 +47,12 @@ python -m scripts.train_tyre_model --year 2025 --max-races 10   # train ML model
 Only running the dashboard (e.g. for a Streamlit Cloud–style deploy)? `pip install -r requirements.txt` alone is enough — it skips the FastAPI/scikit-learn/pytest deps the dashboard doesn't use at runtime.
 
 First load of any session downloads from F1's feed (30–90 s). After that it's served from `cache/`.
+
+## Deploy your own
+
+1. Fork/push this repo to your own GitHub account.
+2. On [share.streamlit.io](https://share.streamlit.io), click "New app" and point it at your repo.
+3. Set **Main file path** to `dashboard/streamlit_app.py`, **Branch** to `main`, **Python version** to `3.11`, then deploy. `requirements.txt` (dashboard-only deps) is picked up automatically.
 
 ## API
 
@@ -71,6 +93,7 @@ scripts/train_tyre_model.py
 scripts/smoke_test.py   exercises every route's functions against a real session
 tests/                 offline tests on synthetic data
 data/processed/{year}/{round}.parquet   cached race laps (gitignored, rebuilt on demand)
+docs/img/              README screenshots
 ```
 
 ## Data
