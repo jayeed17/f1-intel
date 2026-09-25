@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +13,23 @@ import pandas as pd
 
 from app.config import CACHE_DIR, PROCESSED_DIR
 
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _writable_cache_dir(preferred: Path) -> Path:
+    """Use the repo's cache/ dir if writable; fall back to a temp dir otherwise
+    (e.g. a read-only deployment filesystem)."""
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.touch()
+        probe.unlink()
+        return preferred
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "f1-intel-cache"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+CACHE_DIR = _writable_cache_dir(CACHE_DIR)
 fastf1.Cache.enable_cache(str(CACHE_DIR))
 
 # Mirrors fastf1.core.Laps.QUICKLAP_THRESHOLD so clean_laps' filtering logic

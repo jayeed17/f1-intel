@@ -1,0 +1,9 @@
+# Full local dev: dashboard + API + ML training + tests.
+-r requirements.txt
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+pydantic>=2.0,<3
+scikit-learn>=1.3,<2
+joblib>=1.3,<2
+pytest>=8.0,<10
+httpx>=0.27,<1

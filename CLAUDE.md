@@ -4,10 +4,11 @@ F1 telemetry analytics + ML. Python 3.10+, FastF1, FastAPI, pandas, scikit-learn
 Owner prefers: minimal explanation, working code, casual tone.
 
 ## Commands
-- Install: `pip install -r requirements.txt`
+- Install (full dev — API + ML + tests): `pip install -r requirements-dev.txt`
+- Install (dashboard only, e.g. Streamlit Cloud): `pip install -r requirements.txt`
 - API: `uvicorn app.main:app --reload` (docs at /docs)
 - Dashboard: `streamlit run dashboard/streamlit_app.py`
-- Tests: `pytest -q` (must stay offline and fast)
+- Tests: `pytest -q` (must stay offline and fast; needs requirements-dev.txt)
 - Train ML: `python -m scripts.train_tyre_model --year 2025 --max-races 10`
 
 ## Architecture

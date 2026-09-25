@@ -20,13 +20,15 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # dashboard + API + ML training + tests
 
 uvicorn app.main:app --reload                 # API → http://127.0.0.1:8000/docs
 streamlit run dashboard/streamlit_app.py      # dashboard
 pytest -q                                     # offline tests
 python -m scripts.train_tyre_model --year 2025 --max-races 10   # train ML model
 ```
+
+Only running the dashboard (e.g. for a Streamlit Cloud–style deploy)? `pip install -r requirements.txt` alone is enough — it skips the FastAPI/scikit-learn/pytest deps the dashboard doesn't use at runtime.
 
 First load of any session downloads from F1's feed (30–90 s). After that it's served from `cache/`.
 
