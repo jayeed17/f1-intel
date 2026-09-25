@@ -30,6 +30,7 @@ Owner prefers: minimal explanation, working code, casual tone.
 - `session.total_laps` may be missing on older FastF1; fall back to `laps.LapNumber.max()`.
 - `get_weather_data()` must be called on the same filtered `Laps` object to stay row-aligned (see `clean_laps(with_weather=True)`).
 - Real-data endpoints were written against the FastF1 3.x API but only unit-tested offline. When something breaks on a real session, fix it in `app/data.py` first.
+- `session.get_circuit_info()` can raise `AttributeError` instead of returning `None` when MultiViewer has no map yet for a `circuit_key` (new season, or a redesigned track — e.g. Catalunya got a new key for 2026). `app/data.py::corners()` catches this, falls back to the previous year's map, and returns an empty frame as a last resort; `assign_corners`/`compare_corners` degrade to unlabelled zones instead of crashing.
 
 ## Roadmap (pick up in order)
 - [ ] Verify every endpoint against a real race (e.g. `2025/Monza`) and fix any FastF1 API drift

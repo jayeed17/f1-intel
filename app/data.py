@@ -5,6 +5,7 @@ import json
 from functools import lru_cache
 
 import fastf1
+import fastf1.mvapi as mvapi
 import numpy as np
 import pandas as pd
 
@@ -54,10 +55,32 @@ def lap_telemetry(lap) -> pd.DataFrame:
     return tel.reset_index(drop=True)
 
 
+_CORNER_COLUMNS = ["Label", "Number", "Distance", "X", "Y"]
+
+
 def corners(session) -> pd.DataFrame:
-    c = session.get_circuit_info().corners.copy()
+    """Corner locations for the session's circuit.
+
+    FastF1 fetches circuit maps from the MultiViewer API by circuit_key, and
+    that map may not exist yet for a freshly started season or a redesigned
+    track (raises AttributeError instead of a clean None). Fall back to the
+    previous year's map for the same key; if that's unavailable too, return
+    an empty frame so callers can degrade instead of crashing.
+    """
+    try:
+        info = session.get_circuit_info()
+    except AttributeError:
+        info = None
+    if info is None:
+        key = session.session_info["Meeting"]["Circuit"]["Key"]
+        info = mvapi.get_circuit_info(year=session.event.year - 1, circuit_key=key)
+        if info is not None:
+            info.add_marker_distance(reference_lap=session.laps.pick_fastest())
+    if info is None:
+        return pd.DataFrame(columns=_CORNER_COLUMNS)
+    c = info.corners.copy()
     c["Label"] = "T" + c["Number"].astype(str) + c["Letter"].fillna("").astype(str)
-    return c[["Label", "Number", "Distance", "X", "Y"]].sort_values("Distance").reset_index(drop=True)
+    return c[_CORNER_COLUMNS].sort_values("Distance").reset_index(drop=True)
 
 
 def clean_laps(session, with_weather: bool = False) -> pd.DataFrame:

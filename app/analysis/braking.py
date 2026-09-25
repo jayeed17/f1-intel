@@ -47,8 +47,12 @@ def braking_zones(tel: pd.DataFrame, min_drop: float = MIN_SPEED_DROP_KPH) -> pd
 
 
 def assign_corners(zones: pd.DataFrame, corners: pd.DataFrame, max_ahead: float = 400) -> pd.DataFrame:
-    """Label each zone with the corner it's braking for (first corner ahead of brake start)."""
-    if zones.empty:
+    """Label each zone with the corner it's braking for (first corner ahead of brake start).
+
+    corners may be empty if no circuit map is published for this session yet
+    (see app.data.corners) — zones are still returned, just unlabelled.
+    """
+    if zones.empty or corners.empty:
         return zones.assign(corner=pd.Series(dtype=str))
     labels = []
     for start in zones["brake_start_m"]:
