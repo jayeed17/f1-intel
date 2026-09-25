@@ -18,13 +18,20 @@ from app.analysis.braking import assign_corners, braking_zones, compare_corners 
 from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
-from app.data import clean_laps, corners, get_lap, lap_telemetry, load_session  # noqa: E402
+from app.data import clean_laps, corners, get_lap, lap_telemetry, load_session, race_laps  # noqa: E402
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
 TEMPLATE = "plotly_dark"
 COMPOUND_COLORS = {"SOFT": "#E8002D", "MEDIUM": "#FFD12E", "HARD": "#F0F0EC"}
+
+# These three need per-lap car telemetry (heavy); the rest only need lap timing,
+# which race_laps() serves from the Parquet cache without touching FastF1.
+TELEMETRY_VIEWS = ["Braking", "Head to head", "Track dominance"]
+PARQUET_VIEWS = ["Tyre degradation", "Strategy", "Team report"]
+DEFAULT_GP = "Italian Grand Prix"
+ALL_SESSIONS = ["R", "Q", "S", "SQ", "FP1", "FP2", "FP3"]
 
 
 def drv_color(drv: str, s) -> str | None:
@@ -40,23 +47,33 @@ def event_names(year: int) -> list[str]:
     return sch[sch["EventDate"] < pd.Timestamp.now()]["EventName"].tolist()
 
 
-@st.cache_resource(show_spinner="Loading session (first load downloads data)...")
-def session(year: int, gp: str, kind: str):
-    return load_session(year, gp, kind, True)
+@st.cache_resource(show_spinner="Downloading telemetry, ~30-60s first time...")
+def session_full(year: int, gp: str, kind: str):
+    """Full session with car telemetry — only called for telemetry views."""
+    return load_session(year, gp, kind, telemetry=True)
+
+
+@st.cache_data(show_spinner="Loading race data, ~10-20s first time (then cached to Parquet)...")
+def cached_race_laps(year: int, gp: str) -> pd.DataFrame:
+    return race_laps(year, gp)
 
 
 with st.sidebar:
     year = st.number_input("Season", 2018, 2030, 2025)
-    gp = st.selectbox("Grand Prix", event_names(int(year))[::-1])
-    kind = st.selectbox("Session", ["R", "Q", "S", "SQ", "FP1", "FP2", "FP3"])
-    view = st.radio("View", ["Braking", "Head to head", "Track dominance",
-                             "Tyre degradation", "Strategy", "Team report"])
+    events = event_names(int(year))[::-1]
+    gp = st.selectbox("Grand Prix", events, index=events.index(DEFAULT_GP) if DEFAULT_GP in events else 0)
+    view = st.radio("View", TELEMETRY_VIEWS + PARQUET_VIEWS)
+    if view in TELEMETRY_VIEWS:
+        kind = st.selectbox("Session", ALL_SESSIONS, index=ALL_SESSIONS.index("Q"))
+    else:
+        kind = "R"
+        st.caption("Uses Race session data (cached to Parquet).")
 
-s = session(int(year), gp, kind)
-drivers = sorted(s.laps["Driver"].dropna().unique())
-st.title(f"{s.event['EventName']} {year} · {kind}")
+st.title(f"{gp} {year} · {kind}")
 
 if view == "Braking":
+    s = session_full(int(year), gp, kind)
+    drivers = sorted(s.laps["Driver"].dropna().unique())
     drv = st.selectbox("Driver", drivers)
     lap = get_lap(s, drv)
     tel = lap_telemetry(lap)
@@ -74,6 +91,8 @@ if view == "Braking":
     st.dataframe(zones, use_container_width=True, hide_index=True)
 
 elif view == "Head to head":
+    s = session_full(int(year), gp, kind)
+    drivers = sorted(s.laps["Driver"].dropna().unique())
     c1, c2 = st.columns(2)
     a = c1.selectbox("Driver A (reference)", drivers, 0)
     b = c2.selectbox("Driver B", drivers, min(1, len(drivers) - 1))
@@ -94,6 +113,8 @@ elif view == "Head to head":
     st.dataframe(compare_corners(ta, tb, corners(s)), use_container_width=True, hide_index=True)
 
 elif view == "Track dominance":
+    s = session_full(int(year), gp, kind)
+    drivers = sorted(s.laps["Driver"].dropna().unique())
     picks = st.multiselect("Drivers", drivers, drivers[:3])
     n = st.slider("Minisectors", 10, 50, 25)
     if len(picks) >= 2:
@@ -108,7 +129,8 @@ elif view == "Track dominance":
         st.write(pts.groupby("Winner")["Minisector"].nunique().rename("minisectors won"))
 
 elif view == "Tyre degradation":
-    cl = clean_laps(s)
+    laps = cached_race_laps(int(year), gp)
+    cl = clean_laps(laps)
     fig = px.scatter(cl, x="TyreLife", y="LapTimeS", color="Compound", hover_data=["Driver", "LapNumber"],
                      color_discrete_map=COMPOUND_COLORS, template=TEMPLATE)
     fig.update_layout(height=450, yaxis_title="lap time (s)")
@@ -119,18 +141,19 @@ elif view == "Tyre degradation":
     st.dataframe(stint_degradation(cl).sort_values("DegPerLap"), use_container_width=True, hide_index=True)
 
 elif view == "Strategy":
-    cl = clean_laps(s)
+    laps = cached_race_laps(int(year), gp)
+    cl = clean_laps(laps)
     model = compound_model(cl)
-    stops = pit_stops(s.laps)
+    stops = pit_stops(laps)
     loss = st.number_input("Pit loss (s)", 5.0, 60.0, estimate_pit_loss(stops))
-    total = int(getattr(s, "total_laps", None) or s.laps["LapNumber"].max())
+    total = int(laps["LapNumber"].max())
     if len(model) < 2:
         st.warning("Need two dry compounds with enough clean laps (wet race or sprint?).")
     else:
         sims = simulate(total, model, loss)
         st.subheader("Model-optimal strategies")
         st.dataframe(sims, use_container_width=True, hide_index=True)
-        act = compare_actual(s.laps, total, model, loss, float(sims["total_s"].iloc[0]))
+        act = compare_actual(laps, total, model, loss, float(sims["total_s"].iloc[0]))
         if not act.empty:
             fig = px.bar(act, x="Driver", y="lost_vs_optimal_s", color="Team", hover_data=["plan"], template=TEMPLATE)
             fig.update_layout(height=400, yaxis_title="seconds lost vs optimal (model)")
@@ -139,7 +162,8 @@ elif view == "Strategy":
         st.dataframe(stops, use_container_width=True, hide_index=True)
 
 elif view == "Team report":
-    rep = team_report(s)
+    laps = cached_race_laps(int(year), gp)
+    rep = team_report(laps)
     st.dataframe(rep, use_container_width=True, hide_index=True)
     gap_cols = [c for c in ["s1_gap", "s2_gap", "s3_gap"] if c in rep]
     long = rep.melt(id_vars="Team", value_vars=gap_cols, var_name="sector", value_name="gap_s")
