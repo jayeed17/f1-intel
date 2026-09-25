@@ -11,8 +11,11 @@ def _s(col: pd.Series) -> pd.Series:
     return col.dt.total_seconds() if pd.api.types.is_timedelta64_dtype(col) else col
 
 
-def team_report(session) -> pd.DataFrame:
-    laps = pd.DataFrame(session.laps).dropna(subset=["Team"])
+def team_report(session_or_laps) -> pd.DataFrame:
+    """Accepts either a live FastF1 session or a plain raw-laps DataFrame
+    (e.g. from app.data.race_laps() / the Parquet cache)."""
+    raw = session_or_laps if isinstance(session_or_laps, pd.DataFrame) else pd.DataFrame(session_or_laps.laps)
+    laps = raw.dropna(subset=["Team"])
     g = laps.groupby("Team")
     df = pd.DataFrame({
         "best_lap": _s(g["LapTime"].min()),
@@ -22,7 +25,7 @@ def team_report(session) -> pd.DataFrame:
         "speed_trap": g["SpeedST"].max(),
     })
 
-    clean = clean_laps(session)
+    clean = clean_laps(raw)
     if not clean.empty:
         df["race_pace"] = clean.groupby("Team")["LapTimeS"].median()
     stops = pit_stops(laps)

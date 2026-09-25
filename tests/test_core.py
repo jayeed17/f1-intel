@@ -5,6 +5,8 @@ import pandas as pd
 from app.analysis.braking import assign_corners, braking_zones, compare_corners
 from app.analysis.delta import lap_delta, minisector_dominance
 from app.analysis.pits import estimate_pit_loss, pit_stops
+from app.analysis.team_report import team_report
+from app.data import clean_laps
 from app.models.degradation import compound_model, stint_degradation
 from app.models.strategy import plan_time, simulate, stint_time
 
@@ -123,3 +125,72 @@ def test_api_health():
     from app.main import app
     r = TestClient(app).get("/health")
     assert r.status_code == 200 and r.json()["ok"]
+
+
+def test_clean_laps_from_dataframe():
+    """clean_laps must accept a plain raw-laps DataFrame (Parquet cache path),
+    not just a live FastF1 session, and reproduce Laps.pick_quicklaps()
+    .pick_wo_box().pick_track_status("1") plus the IsAccurate filter."""
+    rows = [
+        dict(LapTime=82.0, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="1",
+             IsAccurate=True, TyreLife=5, Compound="MEDIUM"),
+        dict(LapTime=83.0, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="1",
+             IsAccurate=True, TyreLife=6, Compound="MEDIUM"),
+        dict(LapTime=84.0, PitInTime=pd.Timedelta(seconds=1000), PitOutTime=pd.NaT,
+             TrackStatus="1", IsAccurate=True, TyreLife=7, Compound="MEDIUM"),  # pit lap
+        dict(LapTime=84.5, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="4",
+             IsAccurate=True, TyreLife=8, Compound="MEDIUM"),  # not green flag
+        dict(LapTime=83.5, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="1",
+             IsAccurate=False, TyreLife=9, Compound="MEDIUM"),  # inaccurate
+        dict(LapTime=95.0, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="1",
+             IsAccurate=True, TyreLife=10, Compound="MEDIUM"),  # slower than 107%
+    ]
+    df = pd.DataFrame(rows)
+    df["LapTime"] = df["LapTime"].apply(lambda s: pd.Timedelta(seconds=s))
+    clean = clean_laps(df)
+    assert sorted(clean["TyreLife"].tolist()) == [5, 6]
+    assert set(clean["LapTimeS"].round(1)) == {82.0, 83.0}
+
+
+def test_race_laps_cache_roundtrip(tmp_path, monkeypatch):
+    """First call loads via FastF1 (mocked) and writes Parquet; second call is
+    served straight from data/processed/{year}/{round}.parquet without touching
+    FastF1 again."""
+    from app import data as data_mod
+
+    monkeypatch.setattr(data_mod, "PROCESSED_DIR", tmp_path)
+    calls = {"n": 0}
+
+    class FakeSession:
+        laps = fake_race()
+
+    def fake_load_session(year, gp, session, telemetry=True):
+        calls["n"] += 1
+        return FakeSession()
+
+    monkeypatch.setattr(data_mod, "load_session", fake_load_session)
+
+    df1 = data_mod.race_laps(2025, 1)
+    assert calls["n"] == 1
+    assert (tmp_path / "2025" / "1.parquet").exists()
+
+    df2 = data_mod.race_laps(2025, 1)
+    assert calls["n"] == 1  # served from Parquet, FastF1 not touched again
+    pd.testing.assert_frame_equal(df1, df2)
+
+
+def test_team_report_from_dataframe():
+    """team_report must accept a plain raw-laps DataFrame (Parquet cache path),
+    not just a live FastF1 session."""
+    df = fake_race(n_drivers=2, laps=20, pit=10)
+    df["TrackStatus"] = "1"
+    df["IsAccurate"] = True
+    df["Sector1Time"] = df["LapTime"] * 0.3
+    df["Sector2Time"] = df["LapTime"] * 0.4
+    df["Sector3Time"] = df["LapTime"] * 0.3
+    df["SpeedST"] = 300 - df["Driver"].str[1:].astype(int) * 5
+
+    rep = team_report(df)
+    assert len(rep) == 2
+    assert "improve" in rep and "race_pace_gap" in rep
+    assert (rep["best_lap_gap"] >= 0).all() and rep["best_lap_gap"].min() == 0

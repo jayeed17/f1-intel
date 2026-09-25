@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 cache/*
 !cache/.gitkeep
+data/processed/
 models/*.joblib
 models/*.json
 .pytest_cache/

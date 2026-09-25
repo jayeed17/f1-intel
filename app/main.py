@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fastf1
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -12,7 +13,7 @@ from app.analysis.delta import lap_delta, minisector_dominance
 from app.analysis.pits import estimate_pit_loss, pit_stops
 from app.analysis.team_report import team_report
 from app.data import (DataError, clean_laps, corners, get_lap, lap_telemetry,
-                      load_session, to_records)
+                      load_session, race_laps, to_records)
 from app.models import tyre_ml
 from app.models.degradation import compound_model, stint_degradation
 from app.models.strategy import compare_actual, simulate
@@ -35,8 +36,17 @@ def _session(year: int, gp: str, session: str, telemetry: bool = True):
         raise HTTPException(404, f"Could not load {year} {gp} {session}: {e}") from e
 
 
-def _total_laps(s) -> int:
-    return int(getattr(s, "total_laps", None) or s.laps["LapNumber"].max())
+def _race_laps(year: int, gp: str, session: str = "R") -> pd.DataFrame:
+    """Raw laps for the given session. Reads from the Parquet cache for "R" sessions
+    (see app.data.race_laps); other sessions always load live from FastF1."""
+    try:
+        if session == "R":
+            return race_laps(year, gp)
+        return pd.DataFrame(_session(year, gp, session, telemetry=False).laps)
+    except DataError:
+        raise
+    except Exception as e:
+        raise HTTPException(404, f"Could not load {year} {gp} {session}: {e}") from e
 
 
 @app.get("/health")
@@ -89,37 +99,37 @@ def dominance(year: int, gp: str, drivers: str = Query(..., description="comma l
 
 @app.get("/{year}/{gp}/degradation")
 def degradation(year: int, gp: str, session: str = "R"):
-    s = _session(year, gp, session, telemetry=False)
-    cl = clean_laps(s)
+    laps = _race_laps(year, gp, session)
+    cl = clean_laps(laps)
     return {"compound_model": compound_model(cl), "stints": to_records(stint_degradation(cl))}
 
 
 @app.get("/{year}/{gp}/pits")
 def pits(year: int, gp: str):
-    s = _session(year, gp, "R", telemetry=False)
-    st = pit_stops(s.laps)
+    laps = _race_laps(year, gp)
+    st = pit_stops(laps)
     return {"estimated_pit_loss_s": estimate_pit_loss(st), "stops": to_records(st)}
 
 
 @app.get("/{year}/{gp}/strategy")
 def strategy(year: int, gp: str, max_stops: int = Query(2, ge=1, le=3), top: int = 10,
              pit_loss: float | None = None):
-    s = _session(year, gp, "R", telemetry=False)
-    model = compound_model(clean_laps(s))
+    laps = _race_laps(year, gp)
+    model = compound_model(clean_laps(laps))
     if len(model) < 2:
         raise HTTPException(422, "Need at least two dry compounds with enough clean laps")
-    loss = pit_loss if pit_loss is not None else estimate_pit_loss(pit_stops(s.laps))
-    total = _total_laps(s)
+    loss = pit_loss if pit_loss is not None else estimate_pit_loss(pit_stops(laps))
+    total = int(laps["LapNumber"].max())
     sims = simulate(total, model, loss, max_stops=max_stops, top=top)
-    actual = compare_actual(s.laps, total, model, loss, float(sims["total_s"].iloc[0]))
+    actual = compare_actual(laps, total, model, loss, float(sims["total_s"].iloc[0]))
     return {"total_laps": total, "pit_loss_s": loss, "compound_model": model,
             "optimal": to_records(sims), "actual_vs_optimal": to_records(actual)}
 
 
 @app.get("/{year}/{gp}/team-report")
 def team(year: int, gp: str, session: str = "R"):
-    s = _session(year, gp, session, telemetry=False)
-    return to_records(team_report(s))
+    laps = _race_laps(year, gp, session)
+    return to_records(team_report(laps))
 
 
 class TyreQuery(BaseModel):

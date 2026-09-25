@@ -11,8 +11,9 @@ Owner prefers: minimal explanation, working code, casual tone.
 - Train ML: `python -m scripts.train_tyre_model --year 2025 --max-races 10`
 
 ## Architecture
-- `app/data.py` is the only place that touches FastF1 objects directly: `load_session` (lru_cached), `get_lap`, `lap_telemetry`, `corners`, `clean_laps`, `to_records`.
-- `app/analysis/*` and `app/models/*` take **plain pandas DataFrames** and return DataFrames/dicts. Keep them FastF1-free (except `team_report`, which takes a session) so they're testable with synthetic data.
+- `app/data.py` is the only place that touches FastF1 objects directly: `load_session` (lru_cached), `get_lap`, `lap_telemetry`, `corners`, `clean_laps`, `race_laps`, `to_records`.
+- `race_laps(year, gp)` reads `data/processed/{year}/{round}.parquet` if present, else loads the race session from FastF1 and writes it there for next time. Only covers the "R" session's raw laps (used by degradation/pits/strategy/team-report); telemetry-based routes (braking/compare/dominance) always load live.
+- `app/analysis/*` and `app/models/*` take **plain pandas DataFrames** and return DataFrames/dicts. Keep them FastF1-free so they're testable with synthetic data. `clean_laps` and `team_report` (both in the FastF1-touching layer) accept either a live session or a plain raw-laps DataFrame, so they work from the Parquet cache too.
 - `app/main.py` routes: load session → call pure functions → `to_records()` for JSON. No analysis logic in routes.
 - Dashboard imports the same functions directly (does not call the API).
 
@@ -33,8 +34,8 @@ Owner prefers: minimal explanation, working code, casual tone.
 - `session.get_circuit_info()` can raise `AttributeError` instead of returning `None` when MultiViewer has no map yet for a `circuit_key` (new season, or a redesigned track — e.g. Catalunya got a new key for 2026). `app/data.py::corners()` catches this, falls back to the previous year's map, and returns an empty frame as a last resort; `assign_corners`/`compare_corners` degrade to unlabelled zones instead of crashing.
 
 ## Roadmap (pick up in order)
-- [ ] Verify every endpoint against a real race (e.g. `2025/Monza`) and fix any FastF1 API drift
-- [ ] Persist processed per-race data to Parquet (`data/processed/{year}/{round}.parquet`) so the API skips FastF1 loads
+- [x] Verify every endpoint against a real race (e.g. `2025/Monza`) and fix any FastF1 API drift
+- [x] Persist processed per-race data to Parquet (`data/processed/{year}/{round}.parquet`) so the API skips FastF1 loads
 - [ ] Race outcome predictor: grid, quali gap to pole, team pace rolling avg, circuit type → finish position (time-based CV, no leakage)
 - [ ] Overtake probability model from gap, tyre age delta, compound delta, circuit
 - [ ] Driver style clustering on throttle/brake traces (early vs late brakers)

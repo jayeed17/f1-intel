@@ -66,9 +66,13 @@ app/
   models/              degradation.py, strategy.py, tyre_ml.py
 dashboard/streamlit_app.py
 scripts/train_tyre_model.py
+scripts/smoke_test.py   exercises every route's functions against a real session
 tests/                 offline tests on synthetic data
+data/processed/{year}/{round}.parquet   cached race laps (gitignored, rebuilt on demand)
 ```
 
 ## Data
 
 FastF1 pulls from F1's live timing service. This project is unofficial and not associated with Formula 1.
+
+Race laps for degradation/pits/strategy/team-report are cached to `data/processed/{year}/{round}.parquet` on first request; later requests for that race skip FastF1 entirely. Telemetry-based routes (braking/compare/dominance) always load live.

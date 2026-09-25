@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "cache"
 MODEL_DIR = ROOT / "models"
+PROCESSED_DIR = ROOT / "data" / "processed"
 
 # Lap-time gain per lap from burning fuel (seconds). Rough public estimate; tune per track.
 FUEL_EFFECT_PER_LAP = 0.035

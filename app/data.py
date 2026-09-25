@@ -3,16 +3,22 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 
 import fastf1
 import fastf1.mvapi as mvapi
 import numpy as np
 import pandas as pd
 
-from app.config import CACHE_DIR
+from app.config import CACHE_DIR, PROCESSED_DIR
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 fastf1.Cache.enable_cache(str(CACHE_DIR))
+
+# Mirrors fastf1.core.Laps.QUICKLAP_THRESHOLD so clean_laps' filtering logic
+# can run on a plain DataFrame (e.g. loaded back from Parquet) without needing
+# a real Laps object.
+_QUICKLAP_THRESHOLD = 1.07
 
 
 class DataError(Exception):
@@ -83,18 +89,54 @@ def corners(session) -> pd.DataFrame:
     return c[_CORNER_COLUMNS].sort_values("Distance").reset_index(drop=True)
 
 
-def clean_laps(session, with_weather: bool = False) -> pd.DataFrame:
-    """Green-flag, non-pit, representative laps as a plain DataFrame (LapTimeS in seconds)."""
-    laps = session.laps.pick_quicklaps().pick_wo_box().pick_track_status("1")
-    laps = laps[laps["IsAccurate"] == True]  # noqa: E712
-    df = pd.DataFrame(laps).reset_index(drop=True)
-    if with_weather and not df.empty:
-        w = laps.get_weather_data().reset_index(drop=True)
-        for col in ("TrackTemp", "AirTemp", "Humidity", "Rainfall"):
-            if col in w.columns:
-                df[col] = w[col].values
+def clean_laps(session_or_laps, with_weather: bool = False) -> pd.DataFrame:
+    """Green-flag, non-pit, representative laps as a plain DataFrame (LapTimeS in seconds).
+
+    Accepts either a live FastF1 session or a plain raw-laps DataFrame (e.g.
+    from race_laps()/Parquet cache). with_weather requires a live session.
+    """
+    if isinstance(session_or_laps, pd.DataFrame):
+        if with_weather:
+            raise ValueError("with_weather requires a live FastF1 session, not cached laps")
+        raw = session_or_laps
+        time_threshold = raw["LapTime"].min() * _QUICKLAP_THRESHOLD
+        mask = ((raw["LapTime"] < time_threshold) & raw["PitInTime"].isna()
+                & raw["PitOutTime"].isna() & (raw["TrackStatus"] == "1")
+                & (raw["IsAccurate"] == True))  # noqa: E712
+        df = raw[mask].reset_index(drop=True)
+    else:
+        laps = session_or_laps.laps.pick_quicklaps().pick_wo_box().pick_track_status("1")
+        laps = laps[laps["IsAccurate"] == True]  # noqa: E712
+        df = pd.DataFrame(laps).reset_index(drop=True)
+        if with_weather and not df.empty:
+            w = laps.get_weather_data().reset_index(drop=True)
+            for col in ("TrackTemp", "AirTemp", "Humidity", "Rainfall"):
+                if col in w.columns:
+                    df[col] = w[col].values
     df["LapTimeS"] = df["LapTime"].dt.total_seconds()
     return df.dropna(subset=["LapTimeS", "TyreLife", "Compound"]).reset_index(drop=True)
+
+
+def _round_number(year: int, gp: str | int) -> int:
+    gp = _gp(gp)
+    return gp if isinstance(gp, int) else int(fastf1.get_event(year, gp)["RoundNumber"])
+
+
+def _processed_path(year: int, round_number: int) -> Path:
+    return PROCESSED_DIR / str(year) / f"{round_number}.parquet"
+
+
+def race_laps(year: int, gp: str | int) -> pd.DataFrame:
+    """Raw laps for a race, as a plain DataFrame. Reads data/processed/{year}/{round}.parquet
+    if present; otherwise loads from FastF1 and writes it for next time."""
+    path = _processed_path(year, _round_number(year, gp))
+    if path.exists():
+        return pd.read_parquet(path)
+    session = load_session(year, gp, "R", telemetry=False)
+    df = pd.DataFrame(session.laps)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path)
+    return df
 
 
 def to_records(df: pd.DataFrame) -> list[dict]:
