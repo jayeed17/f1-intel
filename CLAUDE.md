@@ -33,6 +33,7 @@ Owner prefers: minimal explanation, working code, casual tone.
 - `get_weather_data()` must be called on the same filtered `Laps` object to stay row-aligned (see `clean_laps(with_weather=True)`).
 - Real-data endpoints were written against the FastF1 3.x API but only unit-tested offline. When something breaks on a real session, fix it in `app/data.py` first.
 - `session.get_circuit_info()` can raise `AttributeError` instead of returning `None` when MultiViewer has no map yet for a `circuit_key` (new season, or a redesigned track — e.g. Catalunya got a new key for 2026). `app/data.py::corners()` catches this, falls back to the previous year's map, and returns an empty frame as a last resort; `assign_corners`/`compare_corners` degrade to unlabelled zones instead of crashing.
+- `Session.load()` can return normally (no exception, just a logged warning) while leaving `.laps`/telemetry unloaded — e.g. when `session.f1_api_support` is `False` for that session. Any later access to `.laps`/`.car_data` then raises `fastf1.exceptions.DataNotLoadedError`. `load_session()` verifies both are actually accessible before returning, retries once, and raises `SessionLoadError` (a `DataError` subclass) otherwise — this happens *before* the return so a broken session is never cached by `lru_cache`/`st.cache_resource`. The dashboard shows a "try again / pick another race" message with a Retry button on this specific error.
 
 ## Roadmap (pick up in order)
 - [x] Verify every endpoint against a real race (e.g. `2025/Monza`) and fix any FastF1 API drift

@@ -1,6 +1,7 @@
 """Offline tests on synthetic data. No network, no FastF1 downloads."""
 import numpy as np
 import pandas as pd
+import pytest
 
 from app.analysis.braking import assign_corners, braking_zones, compare_corners
 from app.analysis.delta import lap_delta, minisector_dominance
@@ -194,3 +195,32 @@ def test_team_report_from_dataframe():
     assert len(rep) == 2
     assert "improve" in rep and "race_pace_gap" in rep
     assert (rep["best_lap_gap"] >= 0).all() and rep["best_lap_gap"].min() == 0
+
+
+def test_load_session_raises_and_does_not_cache(monkeypatch):
+    """A session whose load() completes without raising but leaves .laps
+    unloaded (e.g. f1_api_support=False) must surface as SessionLoadError,
+    retry once, and never be cached by lru_cache."""
+    from app import data as data_mod
+
+    load_calls = {"n": 0}
+
+    class FakeSession:
+        def load(self, **kwargs):
+            load_calls["n"] += 1
+
+        @property
+        def laps(self):
+            raise data_mod.DataNotLoadedError(
+                "The data you are trying to access has not been loaded yet. See `Session.load`"
+            )
+
+    monkeypatch.setattr(data_mod.fastf1, "get_session", lambda *a, **k: FakeSession())
+    data_mod.load_session.cache_clear()
+
+    with pytest.raises(data_mod.SessionLoadError):
+        data_mod.load_session(2099, "Fake Grand Prix", "R", telemetry=False)
+
+    assert load_calls["n"] == 2  # initial attempt + one retry
+    assert data_mod.load_session.cache_info().currsize == 0  # never cached
+    data_mod.load_session.cache_clear()

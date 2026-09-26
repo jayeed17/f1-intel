@@ -10,6 +10,7 @@ import fastf1
 import fastf1.mvapi as mvapi
 import numpy as np
 import pandas as pd
+from fastf1.exceptions import DataNotLoadedError
 
 from app.config import CACHE_DIR, PROCESSED_DIR
 
@@ -42,15 +43,42 @@ class DataError(Exception):
     """Raised when requested data doesn't exist (bad driver, lap, session)."""
 
 
+class SessionLoadError(DataError):
+    """Raised when FastF1's Session.load() completes without an exception but
+    silently left data unloaded (e.g. session.f1_api_support is False for that
+    session) — FastF1 only logs a warning in that case, so we must verify
+    explicitly rather than trust a clean return from load()."""
+
+
 def _gp(gp: str | int) -> str | int:
     return int(gp) if isinstance(gp, str) and gp.isdigit() else gp
 
 
 @lru_cache(maxsize=2)
 def load_session(year: int, gp: str | int, session: str = "R", telemetry: bool = True):
-    s = fastf1.get_session(year, _gp(gp), session)
-    s.load(laps=True, telemetry=telemetry, weather=True, messages=False)
-    return s
+    """Load a session and verify the data actually came through.
+
+    FastF1's Session.load() can return normally while leaving .laps (or
+    telemetry) unloaded — e.g. when session.f1_api_support is False, it just
+    logs a warning and skips loading instead of raising. Accessing .laps
+    afterward then raises DataNotLoadedError. We check for that explicitly,
+    retry once (covers transient network issues), and raise before ever
+    returning so a broken session is never cached by lru_cache.
+    """
+    last_error: DataNotLoadedError | None = None
+    for _attempt in range(2):
+        s = fastf1.get_session(year, _gp(gp), session)
+        s.load(laps=True, telemetry=telemetry, weather=True, messages=False)
+        try:
+            _ = s.laps
+            if telemetry:
+                _ = s.car_data
+            return s
+        except DataNotLoadedError as e:
+            last_error = e
+    raise SessionLoadError(
+        f"Could not load {year} {gp} {session} from F1's timing service after 2 attempts: {last_error}"
+    )
 
 
 def get_lap(session, driver: str, lap: str | int = "fastest"):

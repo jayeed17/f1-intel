@@ -19,7 +19,7 @@ from app.analysis.braking import assign_corners, braking_zones, compare_corners 
 from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
-from app.data import DataError, clean_laps, corners, get_lap, lap_telemetry, load_session, race_laps  # noqa: E402
+from app.data import DataError, SessionLoadError, clean_laps, corners, get_lap, lap_telemetry, load_session, race_laps  # noqa: E402
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
@@ -217,6 +217,13 @@ def render_view() -> None:
 
 try:
     render_view()
+except SessionLoadError:
+    st.error("Couldn't download this session from F1's timing service. Try again in a minute or pick another race.")
+    if st.button("Retry"):
+        session_full.clear()
+        cached_race_laps.clear()
+        load_session.cache_clear()
+        st.rerun()
 except DataError as e:
     st.error(f"Data not available: {e}")
 except Exception as e:
