@@ -156,7 +156,7 @@ def build_session(year: int, gp: str, round_number: int, session: str) -> int | 
         cn = compute_corners(s)
     except Exception as e:  # noqa: BLE001
         print(f"  ! {gp} {session}: no corner map ({e})")
-        cn = pd.DataFrame(columns=["Label", "Number", "Distance", "X", "Y"])
+        cn = pd.DataFrame(columns=["Label", "Number", "Distance", "X", "Y", "Estimated"])
     cn.to_parquet(out_dir / "corners.parquet")
 
     tel_dir = out_dir / "telemetry"
@@ -196,6 +196,8 @@ def main() -> None:
     p.add_argument("--sessions", default="Q,R,S,SQ")
     p.add_argument("--only-missing", action="store_true",
                    help="Skip races/sessions already present in the manifest")
+    p.add_argument("--force", action="store_true",
+                   help="Rebuild even if already present in the manifest (ignores --only-missing)")
     args = p.parse_args()
     wanted_sessions = [s.strip() for s in args.sessions.split(",") if s.strip()]
 
@@ -225,7 +227,7 @@ def main() -> None:
             existing = manifest.get(key, {"year": year, "round": round_number, "name": gp,
                                           "sessions": [], "built_at": None})
             to_build = available
-            if args.only_missing:
+            if args.only_missing and not args.force:
                 to_build = [c for c in available if c not in existing["sessions"]]
                 if not to_build:
                     continue

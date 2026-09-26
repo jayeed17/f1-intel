@@ -19,8 +19,8 @@ from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
-                      get_lap, get_session, lap_telemetry, load_session,
-                      prebuilt_built_at, prebuilt_races, race_laps)
+                      get_lap, get_session, has_position_data, lap_telemetry,
+                      load_session, prebuilt_built_at, prebuilt_races, race_laps)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
@@ -102,10 +102,15 @@ def render_view() -> None:
         for _, z in zones.iterrows():
             fig.add_vrect(x0=z["brake_start_m"], x1=z["brake_end_m"], fillcolor="red", opacity=0.2, line_width=0)
         for _, c in cn.iterrows():
-            fig.add_annotation(x=c["Distance"], y=tel["Speed"].max() + 10, text=c["Label"], showarrow=False, font_size=10)
+            label = c["Label"] + (" (est.)" if c.get("Estimated") else "")
+            fig.add_annotation(x=c["Distance"], y=tel["Speed"].max() + 10, text=label, showarrow=False, font_size=10)
         fig.update_layout(template=TEMPLATE, height=450, xaxis_title="Distance (m)", yaxis_title="kph",
                           title=f"{drv} lap {int(lap['LapNumber'])} ({lap['LapTime'].total_seconds():.3f}s) · red = braking")
         st.plotly_chart(fig, use_container_width=True)
+        if not has_position_data(tel):
+            st.caption("No track position data for this session — corner labels are placed by distance only.")
+        if cn.get("Estimated", pd.Series(dtype=bool)).any():
+            st.caption("Corners marked (est.) are estimated from the speed trace, not an official track map.")
         st.dataframe(zones, use_container_width=True, hide_index=True)
 
     elif view == "Head to head":
@@ -131,7 +136,13 @@ def render_view() -> None:
         fig.update_yaxes(title_text="gap (s)", row=3, col=1)
         st.plotly_chart(fig, use_container_width=True)
         st.subheader("Corner by corner (positive diff = B higher / brakes later)")
-        st.dataframe(compare_corners(ta, tb, corners(s)), use_container_width=True, hide_index=True)
+        cn = corners(s)
+        comp = compare_corners(ta, tb, cn)
+        if "Estimated" in cn.columns and not comp.empty:
+            comp = comp.merge(cn[["Label", "Estimated"]].rename(columns={"Label": "corner"}), on="corner", how="left")
+        if cn.get("Estimated", pd.Series(dtype=bool)).any():
+            st.caption("Corners marked Estimated=True are estimated from the speed trace, not an official track map.")
+        st.dataframe(comp, use_container_width=True, hide_index=True)
 
     elif view == "Track dominance":
         s = session_full(int(year), gp, kind)
@@ -139,7 +150,11 @@ def render_view() -> None:
         picks = st.multiselect("Drivers", drivers, drivers[:3])
         n = st.slider("Minisectors", 10, 50, 25)
         if len(picks) >= 2:
-            pts = minisector_dominance({p: lap_telemetry(get_lap(s, p)) for p in picks}, n)
+            tels = {p: lap_telemetry(get_lap(s, p)) for p in picks}
+            if not all(has_position_data(t) for t in tels.values()):
+                st.warning("Track map unavailable for this session.")
+                return
+            pts = minisector_dominance(tels, n)
             cmap = {p: drv_color(p, s) or None for p in picks}
             fig = px.scatter(pts, x="X", y="Y", color="Winner", color_discrete_map=cmap, template=TEMPLATE)
             fig.update_traces(marker_size=6)

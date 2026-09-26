@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 from fastf1.exceptions import DataNotLoadedError
+from scipy.signal import find_peaks
 
 from app.config import CACHE_DIR, PREBUILT_DIR, PROCESSED_DIR
 
@@ -355,12 +356,25 @@ def get_lap(session, driver: str, lap: str | int = "fastest"):
     return out
 
 
+def has_position_data(tel: pd.DataFrame) -> bool:
+    """False for the car-data-only fallback telemetry from lap_telemetry()
+    (no X/Y) — use to gate views that need a track map (e.g. Track dominance)."""
+    return "X" in tel.columns and tel["X"].notna().any()
+
+
 def lap_telemetry(lap) -> pd.DataFrame:
     """Car + position data for one lap with Distance (m), TimeS (s), Brake (bool).
 
     Accepts a live FastF1 Lap (calls .get_telemetry()), a lap Series from
     get_lap() for a PrebuiltSession (reads the bundled parquet file), or one
     from an OpenF1Session (fetches car_data/location live from OpenF1).
+
+    Falls back to car-data-only telemetry (Distance/Speed/Throttle/Brake/TimeS,
+    no X/Y — see has_position_data()) when lap.get_telemetry() itself fails.
+    Confirmed to happen on sessions with malformed position data (e.g. 2026
+    Monaco Race): get_telemetry() merges car and position channels and blows
+    up on the corrupted merge, but get_car_data() alone never touches position
+    data, so distance/speed/brake are still recoverable.
     """
     prebuilt_path = lap.get("_prebuilt_telemetry_path") if hasattr(lap, "get") else None
     if prebuilt_path:
@@ -369,48 +383,183 @@ def lap_telemetry(lap) -> pd.DataFrame:
     if openf1_session is not None:
         duration = lap["LapTime"].total_seconds() if pd.notna(lap["LapTime"]) else 0
         return openf1_session.lap_telemetry(lap["_driver_number"], lap["_date_start"], duration)
-    tel = lap.get_telemetry()
-    if "Distance" not in tel.columns:
-        tel = tel.add_distance()
-    tel = pd.DataFrame(tel).copy()
+    try:
+        tel = lap.get_telemetry()
+        if "Distance" not in tel.columns:
+            tel = tel.add_distance()
+        tel = pd.DataFrame(tel).copy()
+    except Exception:  # noqa: BLE001 — see docstring: a real, reproducible upstream data quirk
+        tel = pd.DataFrame(lap.get_car_data().add_distance()).copy()
+        tel["X"] = np.nan
+        tel["Y"] = np.nan
     tel["TimeS"] = tel["Time"].dt.total_seconds()
     tel["Brake"] = tel["Brake"].astype(bool)
     return tel.reset_index(drop=True)
 
 
-_CORNER_COLUMNS = ["Label", "Number", "Distance", "X", "Y"]
+_CORNER_COLUMNS = ["Label", "Number", "Distance", "X", "Y", "Estimated"]
+
+# Local copy of build_prebuilt.py's session-name map (small and static enough
+# not to justify importing scripts/ from app/ — app is the lower layer).
+_SESSION_NAME_TO_CODE = {
+    "Practice 1": "FP1", "Practice 2": "FP2", "Practice 3": "FP3",
+    "Sprint Qualifying": "SQ", "Sprint Shootout": "SQ", "Sprint": "S",
+    "Qualifying": "Q", "Race": "R",
+}
+
+
+def _lap_length(lap) -> float | None:
+    """Total distance (m) of a live FastF1 lap, from car data alone (no
+    position merge — safe even when this session's position data is broken)."""
+    try:
+        return float(lap.get_car_data().add_distance()["Distance"].iloc[-1])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _previous_season_corners(session, reference_lap) -> pd.DataFrame | None:
+    """Reuse the same event's corner map from last season, only if this
+    session's lap length is within 1% of last season's — guards against
+    reusing stale geometry after a circuit redesign. Tries the prebuilt
+    bundle first (no network, and last season is bundled for almost every
+    2025+ race); falls back to a live lookup of *last year's own* circuit_key
+    (which can differ from this year's for a redesigned track — e.g. this is
+    why the naive "same key, previous year" lookup found nothing for Spain
+    2026) only if that bundle entry is missing.
+    """
+    this_len = _lap_length(reference_lap)
+    if this_len is None:
+        return None
+
+    prev_year = session.event.year - 1
+    gp_name = session.event["EventName"]
+    session_code = _SESSION_NAME_TO_CODE.get(session.name)
+
+    if session_code:
+        prebuilt = _resolve_prebuilt(prev_year, gp_name, session_code)
+        if prebuilt is not None:
+            prev_session = PrebuiltSession(*prebuilt, session_code)
+            prev_cn = prev_session._corners
+            prev_len = None
+            for f in sorted(prev_session._telemetry_dir.glob("*.parquet")):
+                d = pd.read_parquet(f, columns=["Distance"])
+                if not d.empty:
+                    prev_len = float(d["Distance"].max())
+                    break
+            if not prev_cn.empty and prev_len and abs(this_len - prev_len) / prev_len <= 0.01:
+                c = prev_cn.copy()
+                if "Estimated" not in c.columns:
+                    c["Estimated"] = False
+                return c[[col for col in _CORNER_COLUMNS if col in c.columns]]
+
+    try:
+        prev = fastf1.get_session(prev_year, gp_name, session.name)
+        prev_key = prev.session_info["Meeting"]["Circuit"]["Key"]
+        info = mvapi.get_circuit_info(year=prev_year, circuit_key=prev_key)
+        if info is None:
+            return None
+        prev.load(laps=True, telemetry=True, weather=False, messages=False)
+        prev_len = _lap_length(prev.laps.pick_fastest())
+        if prev_len is None or abs(this_len - prev_len) / prev_len > 0.01:
+            return None
+        info.add_marker_distance(reference_lap=reference_lap)
+        if "Distance" not in info.corners.columns or info.corners["Distance"].isna().all():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    c = info.corners.copy()
+    c["Label"] = "T" + c["Number"].astype(str) + c["Letter"].fillna("").astype(str)
+    c["Estimated"] = False
+    return c[_CORNER_COLUMNS]
+
+
+def _speed_trace_corners(tel: pd.DataFrame, min_drop_kph: float = 25.0,
+                         prominence_kph: float = 15.0, lookback_m: float = 300.0) -> pd.DataFrame:
+    """Estimate corner apexes from local minima in a lap's speed trace —
+    the last resort when no circuit map (real or reused) is available at all.
+
+    Coarser than a real map (e.g. a chicane's two apexes may merge into one
+    detected dip, or split into two, depending on how sharp it is), so
+    results are flagged Estimated so the UI can say so. Only needs
+    Distance/Speed, so this works even on the car-data-only telemetry
+    fallback (see lap_telemetry()) that has no X/Y.
+    """
+    t = tel.dropna(subset=["Distance", "Speed"]).sort_values("Distance").reset_index(drop=True)
+    if len(t) < 3:
+        return pd.DataFrame(columns=_CORNER_COLUMNS)
+    speed = t["Speed"].to_numpy()
+    minima, _ = find_peaks(-speed, prominence=prominence_kph)
+
+    rows = []
+    for i in minima:
+        d = t["Distance"].iloc[i]
+        window = t[(t["Distance"] >= d - lookback_m) & (t["Distance"] <= d)]
+        entry_speed = window["Speed"].max() if not window.empty else speed[i]
+        if entry_speed - speed[i] < min_drop_kph:
+            continue
+        rows.append({
+            "Distance": float(d),
+            "X": float(t["X"].iloc[i]) if "X" in t.columns and pd.notna(t["X"].iloc[i]) else np.nan,
+            "Y": float(t["Y"].iloc[i]) if "Y" in t.columns and pd.notna(t["Y"].iloc[i]) else np.nan,
+        })
+    rows.sort(key=lambda r: r["Distance"])
+    for n, r in enumerate(rows, start=1):
+        r["Number"], r["Label"], r["Estimated"] = n, f"C{n}", True
+    return pd.DataFrame(rows, columns=_CORNER_COLUMNS)
 
 
 def corners(session) -> pd.DataFrame:
-    """Corner locations for the session's circuit.
+    """Corner locations for the session's circuit, tried in order:
 
-    FastF1 fetches circuit maps from the MultiViewer API by circuit_key, and
-    that map may not exist yet for a freshly started season or a redesigned
-    track (raises AttributeError instead of a clean None). Separately,
-    get_circuit_info() can raise KeyError if the session's fastest lap has
-    malformed position data (missing a 'Date' column) — a real, reproducible
-    upstream data quirk seen on e.g. 2026 Monaco Race, not a caching issue.
-    Fall back to the previous year's map for the same key; if that's
-    unavailable too, return an empty frame so callers can degrade instead of
-    crashing. Prebuilt/OpenF1 sessions carry no circuit map either way
-    (OpenF1 doesn't expose one).
+    1. This session's own MultiViewer circuit map (session.get_circuit_info()).
+       Can raise AttributeError if no map is published yet for this
+       circuit_key (new season, or a redesigned track), or KeyError if the
+       session's own position data is malformed (e.g. 2026 Monaco Race —
+       add_marker_distance() merges car+position telemetry internally and
+       blows up on the corrupted merge).
+    2. The same event's map from last season, reused only if this session's
+       lap length is within 1% of last season's (see _previous_season_corners).
+    3. Corners estimated from the fastest lap's speed trace (local minima),
+       flagged Estimated=True — used when neither map is available, e.g.
+       Monaco 2026 (broken position data rules out (1) *and* (2), since (2)
+       still needs to place last year's geometry using this session's own
+       telemetry).
+
+    Prebuilt/OpenF1 sessions just return whichever of the above was baked in
+    at build time (OpenF1 sessions never get further than an empty frame —
+    no position feed at all to place a real map against, and no build step
+    to have pre-computed tier 3 either).
     """
     if isinstance(session, (PrebuiltSession, OpenF1Session)):
-        return session._corners
+        cn = session._corners
+        return cn if "Estimated" in cn.columns else cn.assign(Estimated=False)
+
+    try:
+        reference_lap = session.laps.pick_fastest()
+    except Exception:  # noqa: BLE001
+        reference_lap = None
+    if reference_lap is None or getattr(reference_lap, "empty", False):
+        return pd.DataFrame(columns=_CORNER_COLUMNS)
+
     try:
         info = session.get_circuit_info()
     except (AttributeError, KeyError):
         info = None
-    if info is None:
-        key = session.session_info["Meeting"]["Circuit"]["Key"]
-        info = mvapi.get_circuit_info(year=session.event.year - 1, circuit_key=key)
-        if info is not None:
-            info.add_marker_distance(reference_lap=session.laps.pick_fastest())
-    if info is None:
+    if info is not None:
+        c = info.corners.copy()
+        c["Label"] = "T" + c["Number"].astype(str) + c["Letter"].fillna("").astype(str)
+        c["Estimated"] = False
+        return c[_CORNER_COLUMNS].sort_values("Distance").reset_index(drop=True)
+
+    prev = _previous_season_corners(session, reference_lap)
+    if prev is not None:
+        return prev.sort_values("Distance").reset_index(drop=True)
+
+    try:
+        return _speed_trace_corners(lap_telemetry(reference_lap))
+    except Exception:  # noqa: BLE001
         return pd.DataFrame(columns=_CORNER_COLUMNS)
-    c = info.corners.copy()
-    c["Label"] = "T" + c["Number"].astype(str) + c["Letter"].fillna("").astype(str)
-    return c[_CORNER_COLUMNS].sort_values("Distance").reset_index(drop=True)
 
 
 def clean_laps(session_or_laps, with_weather: bool = False) -> pd.DataFrame:

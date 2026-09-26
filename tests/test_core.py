@@ -58,6 +58,51 @@ def test_dominance():
     assert pts["Minisector"].between(0, 9).all()
 
 
+def test_has_position_data():
+    from app.data import has_position_data
+
+    assert has_position_data(fake_lap())
+    no_pos = fake_lap().assign(X=np.nan, Y=np.nan)
+    assert not has_position_data(no_pos)
+
+
+def test_speed_trace_corners_finds_local_minima():
+    """Corner-fallback tier 3: estimate apexes from the speed trace's local
+    minima when no circuit map (real or reused) is available at all."""
+    from app.data import _speed_trace_corners
+
+    cn = _speed_trace_corners(fake_lap())
+    assert list(cn["Label"]) == ["C1", "C2"]
+    assert list(cn["Number"]) == [1, 2]
+    assert cn["Estimated"].all()
+    assert abs(cn["Distance"].iloc[0] - 1150) < 50
+    assert abs(cn["Distance"].iloc[1] - 3150) < 50
+
+
+def test_speed_trace_corners_works_without_position_data():
+    """Must only need Distance/Speed -- works on the car-data-only telemetry
+    fallback from lap_telemetry(), which has no X/Y."""
+    from app.data import _speed_trace_corners
+
+    tel = fake_lap().drop(columns=["X", "Y"])
+    cn = _speed_trace_corners(tel)
+    assert len(cn) == 2
+    assert cn["X"].isna().all() and cn["Y"].isna().all()
+
+
+def test_speed_trace_corners_ignores_shallow_dips():
+    """A <25 kph dip (e.g. a kink, not a real corner) must not register."""
+    from app.data import _speed_trace_corners
+
+    tel = fake_lap(brake_at=())  # flat speed, no braking zones
+    d = tel["Distance"].to_numpy()
+    speed = tel["Speed"].to_numpy().copy()
+    dip = (d >= 2000) & (d < 2100)
+    speed[dip] -= 10.0  # shallow, well under the 25 kph threshold
+    cn = _speed_trace_corners(tel.assign(Speed=speed))
+    assert cn.empty
+
+
 def fake_race(n_drivers=4, laps=50, pit=25):
     rows = []
     for i in range(n_drivers):
@@ -409,3 +454,86 @@ def test_get_session_source_order(monkeypatch):
     monkeypatch.setattr(data_mod, "load_session", fake_load_session_fails)
     with pytest.raises(data_mod.SessionLoadError):
         data_mod.get_session(2026, "Nowhere Grand Prix", "R")
+
+
+class _FakeCarData:
+    """Stand-in for fastf1.core.Telemetry: only needs add_distance()."""
+
+    def __init__(self, df: pd.DataFrame):
+        self._df = df
+
+    def add_distance(self):
+        df = self._df.copy()
+        df["Distance"] = np.arange(len(df)) * 10.0
+        return df
+
+
+class _FakeLapBrokenTelemetry:
+    """A live-FastF1-like Lap whose get_telemetry() fails the way 2026 Monaco
+    Race's does (malformed position data), but get_car_data() still works."""
+
+    def get(self, key, default=None):
+        return default
+
+    def get_telemetry(self):
+        raise KeyError("None of ['Date'] are in the columns")
+
+    def get_car_data(self):
+        return _FakeCarData(pd.DataFrame({
+            "Time": pd.to_timedelta([0, 1, 2, 3, 4], unit="s"),
+            "Speed": [200.0, 150.0, 100.0, 150.0, 200.0],
+            "Throttle": [100.0, 50.0, 0.0, 50.0, 100.0],
+            "Brake": [False, True, True, False, False],
+        }))
+
+
+def test_lap_telemetry_falls_back_to_car_data_when_get_telemetry_fails():
+    """Telemetry fallback: get_telemetry() failing (e.g. Monaco 2026 R's
+    KeyError) must fall back to get_car_data().add_distance() -- Distance/
+    Speed/Throttle/Brake/TimeS recovered, X/Y NaN (no position data)."""
+    from app.data import has_position_data, lap_telemetry
+
+    tel = lap_telemetry(_FakeLapBrokenTelemetry())
+    assert {"Distance", "Speed", "Throttle", "Brake", "TimeS", "X", "Y"} <= set(tel.columns)
+    assert tel["Brake"].dtype == bool
+    assert tel["Distance"].is_monotonic_increasing
+    assert not has_position_data(tel)
+
+
+def test_corners_falls_back_through_all_tiers_to_speed_trace(monkeypatch):
+    """corners() on a live session: this session's map fails, no previous
+    season is available (prebuilt or live), so it must land on the speed-trace
+    estimate rather than crash or return empty."""
+    from app import data as data_mod
+
+    class FakeEvent:
+        year = 2099
+
+        def __getitem__(self, key):
+            return "Fake Grand Prix"
+
+    class FakeLaps:
+        def pick_fastest(self):
+            return _FakeLapBrokenTelemetry()
+
+    class FakeSession:
+        event = FakeEvent()
+        name = "Race"
+        laps = FakeLaps()
+
+        def get_circuit_info(self):
+            raise AttributeError("no map published for this circuit_key yet")
+
+    monkeypatch.setattr(data_mod, "_resolve_prebuilt", lambda *a, **k: None)
+    calls = []
+
+    def fake_get_session(*a, **k):
+        calls.append(a)
+        raise RuntimeError("simulated: no such session last year either")
+
+    monkeypatch.setattr(data_mod.fastf1, "get_session", fake_get_session)
+
+    cn = data_mod.corners(FakeSession())
+    assert calls, "should have attempted the previous-season live lookup before giving up"
+    assert not cn.empty
+    assert cn["Estimated"].all()

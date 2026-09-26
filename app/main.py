@@ -12,8 +12,8 @@ from app.analysis.braking import assign_corners, braking_zones, compare_corners
 from app.analysis.delta import lap_delta, minisector_dominance
 from app.analysis.pits import estimate_pit_loss, pit_stops
 from app.analysis.team_report import team_report
-from app.data import (DataError, clean_laps, corners, get_lap, lap_telemetry,
-                      load_session, race_laps, to_records)
+from app.data import (DataError, clean_laps, corners, get_lap, has_position_data,
+                      lap_telemetry, load_session, race_laps, to_records)
 from app.models import tyre_ml
 from app.models.degradation import compound_model, stint_degradation
 from app.models.strategy import compare_actual, simulate
@@ -92,9 +92,12 @@ def dominance(year: int, gp: str, drivers: str = Query(..., description="comma l
               session: str = "Q", n: int = 25):
     s = _session(year, gp, session)
     tels = {d.upper(): lap_telemetry(get_lap(s, d)) for d in drivers.split(",")}
+    if not all(has_position_data(t) for t in tels.values()):
+        return {"track_map_available": False, "message": "Track map unavailable for this session",
+                "minisectors_won": {}, "points": []}
     pts = minisector_dominance(tels, n)
     share = pts.groupby("Winner")["Minisector"].nunique().to_dict()
-    return {"minisectors_won": share, "points": to_records(pts.iloc[::3])}
+    return {"track_map_available": True, "minisectors_won": share, "points": to_records(pts.iloc[::3])}
 
 
 @app.get("/{year}/{gp}/degradation")
