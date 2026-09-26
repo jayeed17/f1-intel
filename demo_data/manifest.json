@@ -1,0 +1,31 @@
+{
+  "races": [
+    {
+      "year": 2025,
+      "round": 16,
+      "name": "Italian Grand Prix",
+      "sessions": [
+        "Q",
+        "R"
+      ]
+    },
+    {
+      "year": 2025,
+      "round": 8,
+      "name": "Monaco Grand Prix",
+      "sessions": [
+        "Q",
+        "R"
+      ]
+    },
+    {
+      "year": 2025,
+      "round": 12,
+      "name": "British Grand Prix",
+      "sessions": [
+        "Q",
+        "R"
+      ]
+    }
+  ]
+}

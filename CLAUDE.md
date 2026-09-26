@@ -17,6 +17,7 @@ Owner prefers: minimal explanation, working code, casual tone.
 - `app/analysis/*` and `app/models/*` take **plain pandas DataFrames** and return DataFrames/dicts. Keep them FastF1-free so they're testable with synthetic data. `clean_laps` and `team_report` (both in the FastF1-touching layer) accept either a live session or a plain raw-laps DataFrame, so they work from the Parquet cache too.
 - `app/main.py` routes: load session → call pure functions → `to_records()` for JSON. No analysis logic in routes.
 - Dashboard imports the same functions directly (does not call the API).
+- `demo_data/{year}/{round}/{session}/` bundles 3 races (2025 Italian/Monaco/British GP, Q+R) built by `scripts/build_demo_data.py` for a Streamlit Cloud deploy that can't reach F1's timing API. `app/data.py::get_session()`/`race_laps()` check demo_data first (via `DemoSession`, a duck-typed stand-in for a FastF1 session), then the Parquet cache, then live FastF1. `OFFLINE_MODE=true` (env var or `st.secrets`) restricts the dashboard to demo races only and never touches FastF1, even for the schedule.
 
 ## Data conventions
 - Telemetry DataFrame columns used: `Distance` (m), `Speed` (kph), `Brake` (bool), `Throttle` (0–100), `TimeS` (s from lap start), `X`, `Y`.

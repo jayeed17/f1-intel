@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from fastf1.exceptions import DataNotLoadedError
 
-from app.config import CACHE_DIR, PROCESSED_DIR
+from app.config import CACHE_DIR, DEMO_DATA_DIR, PROCESSED_DIR, offline_mode
 
 
 def _writable_cache_dir(preferred: Path) -> Path:
@@ -54,6 +54,78 @@ def _gp(gp: str | int) -> str | int:
     return int(gp) if isinstance(gp, str) and gp.isdigit() else gp
 
 
+_LIVE_DATA_UNAVAILABLE = (
+    "Live data isn't reachable from this server. Try one of the demo races, "
+    "or run locally for every race."
+)
+
+
+@lru_cache(maxsize=1)
+def _demo_manifest() -> list[dict]:
+    path = DEMO_DATA_DIR / "manifest.json"
+    if not path.exists():
+        return []
+    return json.loads(path.read_text())["races"]
+
+
+def demo_years() -> list[int]:
+    """Years that have at least one bundled demo race."""
+    return sorted({r["year"] for r in _demo_manifest()})
+
+
+def demo_race_names(year: int) -> list[str]:
+    """Bundled demo race names for a year, in manifest order."""
+    return [r["name"] for r in _demo_manifest() if r["year"] == year]
+
+
+def demo_sessions_for(year: int, gp: str) -> list[str]:
+    """Session codes bundled for a demo race, without touching FastF1's schedule."""
+    for r in _demo_manifest():
+        if r["year"] == year and r["name"].lower() == str(gp).lower():
+            return list(r["sessions"])
+    return []
+
+
+def _resolve_demo(year: int, gp: str | int, session: str) -> tuple[int, int] | None:
+    gp_norm = _gp(gp)
+    for r in _demo_manifest():
+        if r["year"] != year or session not in r["sessions"]:
+            continue
+        if gp_norm == r["round"] or (isinstance(gp_norm, str) and gp_norm.lower() == r["name"].lower()):
+            return year, r["round"]
+    return None
+
+
+def is_demo_race(year: int, gp: str | int) -> bool:
+    gp_norm = _gp(gp)
+    return any(
+        r["year"] == year
+        and (gp_norm == r["round"] or (isinstance(gp_norm, str) and gp_norm.lower() == r["name"].lower()))
+        for r in _demo_manifest()
+    )
+
+
+class DemoSession:
+    """Duck-typed stand-in for a FastF1 Session, backed by bundled demo_data/.
+
+    Exposes .laps/.results as plain DataFrames and works with get_lap(),
+    lap_telemetry(), and corners() without ever touching FastF1.
+    """
+
+    def __init__(self, year: int, round_number: int, session: str):
+        base = DEMO_DATA_DIR / str(year) / str(round_number) / session
+        self.year = year
+        self.round_number = round_number
+        self.session_code = session
+        self.laps = pd.read_parquet(base / "laps.parquet")
+        self.results = pd.read_parquet(base / "results.parquet")
+        self._corners = pd.read_parquet(base / "corners.parquet")
+        self._telemetry_dir = base / "telemetry"
+
+    def telemetry_path(self, driver: str) -> Path:
+        return self._telemetry_dir / f"{driver.upper()}.parquet"
+
+
 @lru_cache(maxsize=2)
 def load_session(year: int, gp: str | int, session: str = "R", telemetry: bool = True):
     """Load a session and verify the data actually came through.
@@ -81,7 +153,30 @@ def load_session(year: int, gp: str | int, session: str = "R", telemetry: bool =
     )
 
 
+def get_session(year: int, gp: str | int, session: str = "R", telemetry: bool = True):
+    """Session-like object for telemetry views: demo_data first, else a live
+    FastF1 session via load_session(). In offline_mode(), raises immediately
+    (without ever touching FastF1) if this race isn't bundled as demo data.
+    """
+    demo = _resolve_demo(year, gp, session)
+    if demo is not None:
+        return DemoSession(*demo, session)
+    if offline_mode():
+        raise SessionLoadError(_LIVE_DATA_UNAVAILABLE)
+    return load_session(year, gp, session, telemetry=telemetry)
+
+
 def get_lap(session, driver: str, lap: str | int = "fastest"):
+    if isinstance(session, DemoSession):
+        driver = driver.upper()
+        rows = session.laps[session.laps["Driver"] == driver]
+        if rows.empty:
+            raise DataError(f"No laps for driver {driver}")
+        if str(lap) != "fastest":
+            raise DataError("Demo data only includes each driver's fastest lap")
+        row = rows.loc[rows["LapTime"].idxmin()].copy()
+        row["_demo_telemetry_path"] = str(session.telemetry_path(driver))
+        return row
     laps = session.laps.pick_drivers(driver.upper())
     if laps.empty:
         raise DataError(f"No laps for driver {driver}")
@@ -96,7 +191,14 @@ def get_lap(session, driver: str, lap: str | int = "fastest"):
 
 
 def lap_telemetry(lap) -> pd.DataFrame:
-    """Car + position data for one lap with Distance (m), TimeS (s), Brake (bool)."""
+    """Car + position data for one lap with Distance (m), TimeS (s), Brake (bool).
+
+    Accepts either a live FastF1 Lap (calls .get_telemetry()) or a lap Series
+    returned by get_lap() for a DemoSession (reads the bundled parquet file).
+    """
+    demo_path = lap.get("_demo_telemetry_path") if hasattr(lap, "get") else None
+    if demo_path:
+        return pd.read_parquet(demo_path)
     tel = lap.get_telemetry()
     if "Distance" not in tel.columns:
         tel = tel.add_distance()
@@ -118,6 +220,8 @@ def corners(session) -> pd.DataFrame:
     previous year's map for the same key; if that's unavailable too, return
     an empty frame so callers can degrade instead of crashing.
     """
+    if isinstance(session, DemoSession):
+        return session._corners
     try:
         info = session.get_circuit_info()
     except AttributeError:
@@ -137,9 +241,12 @@ def corners(session) -> pd.DataFrame:
 def clean_laps(session_or_laps, with_weather: bool = False) -> pd.DataFrame:
     """Green-flag, non-pit, representative laps as a plain DataFrame (LapTimeS in seconds).
 
-    Accepts either a live FastF1 session or a plain raw-laps DataFrame (e.g.
-    from race_laps()/Parquet cache). with_weather requires a live session.
+    Accepts a live FastF1 session, a DemoSession, or a plain raw-laps
+    DataFrame (e.g. from race_laps()/Parquet cache). with_weather requires a
+    live session.
     """
+    if isinstance(session_or_laps, DemoSession):
+        session_or_laps = session_or_laps.laps
     if isinstance(session_or_laps, pd.DataFrame):
         if with_weather:
             raise ValueError("with_weather requires a live FastF1 session, not cached laps")
@@ -172,8 +279,16 @@ def _processed_path(year: int, round_number: int) -> Path:
 
 
 def race_laps(year: int, gp: str | int) -> pd.DataFrame:
-    """Raw laps for a race, as a plain DataFrame. Reads data/processed/{year}/{round}.parquet
-    if present; otherwise loads from FastF1 and writes it for next time."""
+    """Raw laps for a race, as a plain DataFrame. Checks demo_data/ first, then
+    data/processed/{year}/{round}.parquet, then falls back to live FastF1
+    (which writes the Parquet cache for next time). In offline_mode(), raises
+    before ever resolving a round number or touching FastF1 for a non-demo race.
+    """
+    demo = _resolve_demo(year, gp, "R")
+    if demo is not None:
+        return DemoSession(*demo, "R").laps
+    if offline_mode():
+        raise SessionLoadError(_LIVE_DATA_UNAVAILABLE)
     path = _processed_path(year, _round_number(year, gp))
     if path.exists():
         return pd.read_parquet(path)

@@ -224,3 +224,54 @@ def test_load_session_raises_and_does_not_cache(monkeypatch):
     assert load_calls["n"] == 2  # initial attempt + one retry
     assert data_mod.load_session.cache_info().currsize == 0  # never cached
     data_mod.load_session.cache_clear()
+
+
+def test_demo_races_render_all_views_offline(monkeypatch):
+    """Every bundled demo race/session must serve all 6 dashboard views
+    through the data layer (get_session/get_lap/lap_telemetry/corners for the
+    telemetry views, race_laps/clean_laps/team_report/pit_stops for the
+    Parquet-backed views) with zero FastF1 network calls."""
+    from app import data as data_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("FastF1 network call attempted while serving demo data")
+
+    monkeypatch.setattr(data_mod.fastf1, "get_session", _boom)
+
+    manifest = data_mod._demo_manifest()
+    assert manifest, "demo_data/manifest.json is empty — run scripts/build_demo_data.py"
+
+    telemetry_cols = {"Distance", "Speed", "Throttle", "Brake", "TimeS", "X", "Y"}
+
+    for race in manifest:
+        year, gp = race["year"], race["name"]
+        for session in race["sessions"]:
+            s = data_mod.get_session(year, gp, session)
+            drivers = sorted(s.laps["Driver"].dropna().unique())
+            assert len(drivers) >= 2
+
+            tels = {}
+            for drv in drivers[:3]:
+                lap = data_mod.get_lap(s, drv)
+                tel = data_mod.lap_telemetry(lap)
+                assert not tel.empty
+                assert telemetry_cols <= set(tel.columns)
+                tels[drv] = tel
+            cn = data_mod.corners(s)
+            assert not cn.empty
+
+            a, b = drivers[0], drivers[1]
+            assert isinstance(assign_corners(braking_zones(tels[a]), cn), pd.DataFrame)  # Braking view
+            assert not lap_delta(tels[a], tels[b]).empty  # Head to head view
+            compare_corners(tels[a], tels[b], cn)
+            assert not minisector_dominance(tels, n=10).empty  # Track dominance view
+
+        # Degradation / Strategy / Team report views always use the Race session
+        laps = data_mod.race_laps(year, gp)
+        cl = clean_laps(laps)
+        assert not cl.empty
+        assert compound_model(cl)
+        assert not stint_degradation(cl).empty
+        stops = pit_stops(laps)
+        assert estimate_pit_loss(stops) > 0
+        assert not team_report(laps).empty
