@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import gc
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import fastf1  # noqa: E402
 import fastf1.plotting  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.express as px  # noqa: E402
@@ -21,36 +19,19 @@ from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
-                      demo_race_names, demo_sessions_for, demo_years,
                       get_lap, get_session, lap_telemetry, load_session,
-                      offline_mode, race_laps)
+                      prebuilt_built_at, prebuilt_races, race_laps)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
-
-# Let OFFLINE_MODE be set via st.secrets (Streamlit Cloud) as well as env var —
-# app.data / app.config only read the environment, so bridge it here once.
-if "OFFLINE_MODE" not in os.environ:
-    try:
-        if st.secrets.get("OFFLINE_MODE"):
-            os.environ["OFFLINE_MODE"] = str(st.secrets["OFFLINE_MODE"])
-    except Exception:
-        pass
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
 TEMPLATE = "plotly_dark"
 COMPOUND_COLORS = {"SOFT": "#E8002D", "MEDIUM": "#FFD12E", "HARD": "#F0F0EC"}
 
-# These three need per-lap car telemetry (heavy); the rest only need lap timing,
-# which race_laps() serves from the Parquet cache without touching FastF1.
+# These three need per-lap car telemetry (heavy); the rest only need lap timing.
 TELEMETRY_VIEWS = ["Braking", "Head to head", "Track dominance"]
 PARQUET_VIEWS = ["Tyre degradation", "Strategy", "Team report"]
-DEFAULT_GP = "Italian Grand Prix"
 _SESSION_ORDER = ["FP1", "FP2", "FP3", "SQ", "S", "Q", "R"]
-_SESSION_NAME_TO_CODE = {
-    "Practice 1": "FP1", "Practice 2": "FP2", "Practice 3": "FP3",
-    "Sprint Qualifying": "SQ", "Sprint Shootout": "SQ", "Sprint": "S",
-    "Qualifying": "Q", "Race": "R",
-}
 
 
 def drv_color(drv: str, s) -> str | None:
@@ -60,81 +41,39 @@ def drv_color(drv: str, s) -> str | None:
         return None
 
 
-@st.cache_data(show_spinner=False)
-def event_names(year: int) -> list[str]:
-    if offline_mode():
-        return demo_race_names(year)
-    sch = fastf1.get_event_schedule(year, include_testing=False)
-    return sch[sch["EventDate"] < pd.Timestamp.now()]["EventName"].tolist()
-
-
-@st.cache_data(show_spinner=False)
-def available_sessions(year: int, gp: str) -> list[str]:
-    """Session codes that actually happened this weekend (most weekends have no
-    Sprint/Sprint Qualifying — hide those instead of offering a dead option)."""
-    if offline_mode():
-        codes = demo_sessions_for(year, gp)
-        return [c for c in _SESSION_ORDER if c in codes] or ["R"]
-    sch = fastf1.get_event_schedule(year, include_testing=False)
-    row = sch[sch["EventName"] == gp]
-    codes = set()
-    if not row.empty:
-        row = row.iloc[0]
-        for i in range(1, 6):
-            code = _SESSION_NAME_TO_CODE.get(row.get(f"Session{i}"))
-            if code:
-                codes.add(code)
-    return [c for c in _SESSION_ORDER if c in codes] or ["R"]
-
-
-@st.cache_resource(show_spinner="Downloading telemetry, ~30-60s first time...", max_entries=2, ttl=3600)
+@st.cache_resource(show_spinner="Loading session...", max_entries=2, ttl=3600)
 def session_full(year: int, gp: str, kind: str):
-    """Full session with car telemetry — demo_data first, else a live FastF1 load."""
+    """Full session with car telemetry: prebuilt bundle -> OpenF1 -> live FastF1."""
     return get_session(year, gp, kind, telemetry=True)
 
 
-@st.cache_data(show_spinner="Loading race data, ~10-20s first time (then cached to Parquet)...")
+@st.cache_data(show_spinner="Loading race data...")
 def cached_race_laps(year: int, gp: str) -> pd.DataFrame:
     return race_laps(year, gp)
 
 
-def _gp_options(year: int) -> tuple[list[str], dict[str, str]]:
-    """Display labels for the Grand Prix dropdown, demo races first and
-    suffixed "(instant)"; returns (labels, {label: real_event_name})."""
-    demo_names = set(demo_race_names(year))
-    if offline_mode():
-        all_names = demo_race_names(year)
-    else:
-        all_names = event_names(year)[::-1]
-    ordered = [n for n in all_names if n in demo_names] + [n for n in all_names if n not in demo_names]
-    mapping = {(f"{n} (instant)" if n in demo_names else n): n for n in ordered}
-    return list(mapping.keys()), mapping
+def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
+    """Race dropdown labels, newest first, straight from the prebuilt manifest."""
+    races = prebuilt_races()
+    labels = [f"{r['year']} {r['name']}" for r in races]
+    mapping = {f"{r['year']} {r['name']}": (r["year"], r["name"]) for r in races}
+    return labels, mapping
 
 
 with st.sidebar:
-    if offline_mode():
-        st.caption("Offline mode — only bundled demo races are available.")
-        years = demo_years()
-        year = st.selectbox("Season", years, index=0) if years else 2025
-    else:
-        year = st.number_input("Season", 2018, 2030, 2025)
-
-    gp_options, gp_map = _gp_options(int(year))
-    if not gp_options:
-        st.error("No races available.")
+    race_labels, race_map = _race_options()
+    if not race_labels:
+        st.error("No prebuilt race data available. Run scripts/build_prebuilt.py.")
         st.stop()
-    default_label = next((lbl for lbl, real in gp_map.items() if real == DEFAULT_GP), gp_options[0])
-    gp_label = st.selectbox("Grand Prix", gp_options,
-                            index=gp_options.index(default_label) if default_label in gp_options else 0)
-    gp = gp_map[gp_label]
+    race_label = st.selectbox("Race", race_labels, index=0)
+    year, gp = race_map[race_label]
 
     view = st.radio("View", TELEMETRY_VIEWS + PARQUET_VIEWS)
     if view in TELEMETRY_VIEWS:
-        sessions = available_sessions(int(year), gp)
-        kind = st.selectbox("Session", sessions, index=sessions.index("Q") if "Q" in sessions else 0)
+        kind = st.selectbox("Session", _SESSION_ORDER, index=_SESSION_ORDER.index("Q"))
     else:
         kind = "R"
-        st.caption("Uses Race session data (cached to Parquet).")
+        st.caption("Uses Race session data.")
 
 _race = (int(year), gp)
 if st.session_state.get("_prev_race") not in (None, _race):
@@ -142,6 +81,9 @@ if st.session_state.get("_prev_race") not in (None, _race):
 st.session_state["_prev_race"] = _race
 
 st.title(f"{gp} {year} · {kind}")
+built_at = prebuilt_built_at(year, gp)
+if built_at:
+    st.caption(f"Data updated: {built_at}")
 
 def render_view() -> None:
     if view == "Braking":
@@ -262,7 +204,7 @@ def render_view() -> None:
 try:
     render_view()
 except SessionLoadError:
-    st.error("Live data isn't reachable from this server. Try one of the demo races, or run locally for every race.")
+    st.error("This session isn't available yet — it's added automatically a few hours after it ends.")
     if st.button("Retry"):
         session_full.clear()
         cached_race_laps.clear()

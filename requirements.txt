@@ -1,6 +1,7 @@
 # Streamlit Community Cloud / dashboard-only runtime (Python 3.11).
 # For the API, ML training, and tests, use requirements-dev.txt instead.
 fastf1>=3.8,<4
+requests>=2.31,<3
 pandas>=2.2,<3
 pyarrow>=15,<26
 numpy>=2.0,<3

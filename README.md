@@ -54,6 +54,8 @@ First load of any session downloads from F1's feed (30–90 s). After that it's 
 2. On [share.streamlit.io](https://share.streamlit.io), click "New app" and point it at your repo.
 3. Set **Main file path** to `dashboard/streamlit_app.py`, **Branch** to `main`, **Python version** to `3.11`, then deploy. `requirements.txt` (dashboard-only deps) is picked up automatically.
 
+Streamlit Cloud can't reach F1's live timing feed at all, so the dashboard is backed by `data/prebuilt/` — every 2025 race and every completed 2026 race, rebuilt automatically by `.github/workflows/update-data.yml` every Monday and Sunday night (or on demand via workflow_dispatch), which commits and pushes any new data straight to this repo. A race that isn't prebuilt yet falls back to the [OpenF1](https://openf1.org) API, then to a live FastF1 load if you're running locally.
+
 ## API
 
 | Method | Path | Example |
@@ -91,8 +93,11 @@ app/
 dashboard/streamlit_app.py
 scripts/train_tyre_model.py
 scripts/smoke_test.py   exercises every route's functions against a real session
+scripts/build_prebuilt.py   builds data/prebuilt/ (run locally or by the update-data Action)
 tests/                 offline tests on synthetic data
-data/processed/{year}/{round}.parquet   cached race laps (gitignored, rebuilt on demand)
+data/processed/{year}/{round}.parquet   Parquet cache for live-loaded races (gitignored)
+data/prebuilt/{year}/{round}/{session}/   committed prebuilt bundle: laps/results/corners/telemetry parquet + manifest.json
+.github/workflows/update-data.yml   rebuilds data/prebuilt/ twice a week
 docs/img/              README screenshots
 ```
 
@@ -100,4 +105,4 @@ docs/img/              README screenshots
 
 FastF1 pulls from F1's live timing service. This project is unofficial and not associated with Formula 1.
 
-Race laps for degradation/pits/strategy/team-report are cached to `data/processed/{year}/{round}.parquet` on first request; later requests for that race skip FastF1 entirely. Telemetry-based routes (braking/compare/dominance) always load live.
+The dashboard reads from three sources, in order: the **prebuilt bundle** (`data/prebuilt/`, committed to the repo and refreshed automatically — see Deploy above), the **[OpenF1](https://openf1.org) API** for a race that isn't prebuilt yet, and finally a **live FastF1 load** (only reachable when running locally; Streamlit Cloud can't reach F1's timing service). If none of the three have the session yet, the dashboard says so and suggests trying again later. Race laps loaded live are also cached to `data/processed/{year}/{round}.parquet` so a second local request skips FastF1.
