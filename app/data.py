@@ -46,7 +46,7 @@ def _gp(gp: str | int) -> str | int:
     return int(gp) if isinstance(gp, str) and gp.isdigit() else gp
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=2)
 def load_session(year: int, gp: str | int, session: str = "R", telemetry: bool = True):
     s = fastf1.get_session(year, _gp(gp), session)
     s.load(laps=True, telemetry=telemetry, weather=True, messages=False)

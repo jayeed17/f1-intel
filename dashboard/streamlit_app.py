@@ -1,6 +1,7 @@
 """Streamlit dashboard. Run from repo root: streamlit run dashboard/streamlit_app.py"""
 from __future__ import annotations
 
+import gc
 import sys
 from pathlib import Path
 
@@ -68,7 +69,7 @@ def available_sessions(year: int, gp: str) -> list[str]:
     return [c for c in _SESSION_ORDER if c in codes] or ["R"]
 
 
-@st.cache_resource(show_spinner="Downloading telemetry, ~30-60s first time...")
+@st.cache_resource(show_spinner="Downloading telemetry, ~30-60s first time...", max_entries=2, ttl=3600)
 def session_full(year: int, gp: str, kind: str):
     """Full session with car telemetry — only called for telemetry views."""
     return load_session(year, gp, kind, telemetry=True)
@@ -90,6 +91,11 @@ with st.sidebar:
     else:
         kind = "R"
         st.caption("Uses Race session data (cached to Parquet).")
+
+_race = (int(year), gp)
+if st.session_state.get("_prev_race") not in (None, _race):
+    gc.collect()
+st.session_state["_prev_race"] = _race
 
 st.title(f"{gp} {year} · {kind}")
 
