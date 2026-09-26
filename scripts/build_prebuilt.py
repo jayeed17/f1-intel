@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import time
 
 import fastf1
 import pandas as pd
+from fastf1.exceptions import RateLimitExceededError
 
 from app.config import PREBUILT_DIR
+from app.data import SessionLoadError
 from app.data import corners as compute_corners
 from app.data import get_lap, lap_telemetry, load_session
 
@@ -27,6 +31,76 @@ _SESSION_NAME_TO_CODE = {
     "Sprint Qualifying": "SQ", "Sprint Shootout": "SQ", "Sprint": "S",
     "Qualifying": "Q", "Race": "R",
 }
+
+# Seconds to wait before each retry on FastF1's hard rate limit (500 calls/h,
+# or 200/h on ergast.com) — ~25 min worst case before giving up on one session.
+_RATE_LIMIT_BACKOFFS = [60, 120, 240, 480, 600]
+
+_FAILURE_LABELS = {
+    "rate_limited": "RATE LIMITED",
+    "download_failed": "DOWNLOAD FAILED",
+    "not_published": "NOT PUBLISHED YET",
+}
+
+
+class _Fastf1WarningCapture(logging.Handler):
+    """Captures FastF1's internal "Failed to load X data!" warnings.
+
+    FastF1 catches exceptions (network errors, and — we've confirmed live —
+    a rate limit mid-fetch) around several of its own sub-loads and just logs
+    a warning instead of raising, which leaves .laps/.car_data unset without
+    telling calling code why. That's the only way to tell "this genuinely
+    isn't published yet" apart from "a download inside FastF1 silently
+    failed" — both otherwise surface identically as SessionLoadError.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        msg = record.getMessage()
+        if "failed to load" in msg.lower() or "failed to add" in msg.lower():
+            self.messages.append(msg)
+
+
+def _load_with_diagnosis(year: int, gp: str, round_number: int, session: str):
+    """Load a session, classifying *why* it failed instead of guessing.
+
+    Returns (session_obj, None) on success, or (None, (category, detail)) on
+    failure where category is "rate_limited", "download_failed", or
+    "not_published". Retries with backoff on a hard rate limit rather than
+    giving up immediately.
+    """
+    capture = _Fastf1WarningCapture()
+    fastf1_logger = logging.getLogger("fastf1")
+    fastf1_logger.addHandler(capture)
+    try:
+        attempt = 0
+        while True:
+            capture.messages.clear()
+            try:
+                return load_session(year, round_number, session, telemetry=True), None
+            except RateLimitExceededError as e:
+                if attempt >= len(_RATE_LIMIT_BACKOFFS):
+                    return None, ("rate_limited", f"gave up after {attempt} retries: {e}")
+                wait = _RATE_LIMIT_BACKOFFS[attempt]
+                print(f"  ! rate limited loading {gp} {session} — backing off {wait}s "
+                      f"(retry {attempt + 1}/{len(_RATE_LIMIT_BACKOFFS)})")
+                time.sleep(wait)
+                attempt += 1
+            except SessionLoadError as e:
+                # FastF1's Session.load() completed without raising but left data
+                # unset. If it logged a "Failed to load" warning along the way,
+                # that's a real (likely transient/rate-limit) download failure,
+                # not evidence the session isn't published yet.
+                if capture.messages:
+                    return None, ("download_failed", "; ".join(capture.messages))
+                return None, ("not_published", str(e))
+            except Exception as e:  # noqa: BLE001
+                return None, ("download_failed", f"{type(e).__name__}: {e}")
+    finally:
+        fastf1_logger.removeHandler(capture)
 
 
 def _manifest_path():
@@ -61,10 +135,10 @@ def build_session(year: int, gp: str, round_number: int, session: str) -> int | 
     """Build one session's parquet files. Returns driver count on success,
     None if the session couldn't be loaded at all (skipped, not fatal)."""
     out_dir = PREBUILT_DIR / str(year) / str(round_number) / session
-    try:
-        s = load_session(year, round_number, session, telemetry=True)
-    except Exception as e:  # noqa: BLE001 — one bad session shouldn't kill the whole build
-        print(f"  ! skipping {year} {gp} {session}: could not load ({e})")
+    s, failure = _load_with_diagnosis(year, gp, round_number, session)
+    if failure is not None:
+        category, detail = failure
+        print(f"  ! {_FAILURE_LABELS[category]}: {year} {gp} {session}: {detail}")
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)

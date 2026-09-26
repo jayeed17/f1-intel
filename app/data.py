@@ -386,16 +386,20 @@ def corners(session) -> pd.DataFrame:
 
     FastF1 fetches circuit maps from the MultiViewer API by circuit_key, and
     that map may not exist yet for a freshly started season or a redesigned
-    track (raises AttributeError instead of a clean None). Fall back to the
-    previous year's map for the same key; if that's unavailable too, return
-    an empty frame so callers can degrade instead of crashing. Prebuilt/OpenF1
-    sessions carry no circuit map either way (OpenF1 doesn't expose one).
+    track (raises AttributeError instead of a clean None). Separately,
+    get_circuit_info() can raise KeyError if the session's fastest lap has
+    malformed position data (missing a 'Date' column) — a real, reproducible
+    upstream data quirk seen on e.g. 2026 Monaco Race, not a caching issue.
+    Fall back to the previous year's map for the same key; if that's
+    unavailable too, return an empty frame so callers can degrade instead of
+    crashing. Prebuilt/OpenF1 sessions carry no circuit map either way
+    (OpenF1 doesn't expose one).
     """
     if isinstance(session, (PrebuiltSession, OpenF1Session)):
         return session._corners
     try:
         info = session.get_circuit_info()
-    except AttributeError:
+    except (AttributeError, KeyError):
         info = None
     if info is None:
         key = session.session_info["Meeting"]["Circuit"]["Key"]
