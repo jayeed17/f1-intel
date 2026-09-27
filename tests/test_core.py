@@ -91,14 +91,14 @@ def test_speed_trace_corners_works_without_position_data():
 
 
 def test_speed_trace_corners_ignores_shallow_dips():
-    """A <25 kph dip (e.g. a kink, not a real corner) must not register."""
+    """A <15 kph dip (e.g. a kink, not a real corner) must not register."""
     from app.data import _speed_trace_corners
 
     tel = fake_lap(brake_at=())  # flat speed, no braking zones
     d = tel["Distance"].to_numpy()
     speed = tel["Speed"].to_numpy().copy()
     dip = (d >= 2000) & (d < 2100)
-    speed[dip] -= 10.0  # shallow, well under the 25 kph threshold
+    speed[dip] -= 8.0  # shallow, well under the 15 kph threshold
     cn = _speed_trace_corners(tel.assign(Speed=speed))
     assert cn.empty
 
@@ -537,3 +537,42 @@ def test_corners_falls_back_through_all_tiers_to_speed_trace(monkeypatch):
     assert calls, "should have attempted the previous-season live lookup before giving up"
     assert not cn.empty
     assert cn["Estimated"].all()
+
+
+class _FakeLiveLaps:
+    """Stand-in for fastf1.core.Laps: only the bits get_lap() touches."""
+
+    def __init__(self, df: pd.DataFrame):
+        self._df = df
+
+    @property
+    def empty(self):
+        return self._df.empty
+
+    def pick_fastest(self, only_by_time: bool = False):
+        df = self._df if only_by_time else self._df[self._df["IsPersonalBest"] == True]  # noqa: E712
+        valid = df[df["LapTime"].notna()]
+        if valid.empty:
+            return None
+        return valid.loc[valid["LapTime"].idxmin()]
+
+    def pick_drivers(self, driver):
+        return _FakeLiveLaps(self._df[self._df["Driver"] == driver])
+
+
+def test_get_lap_falls_back_to_lowest_laptime_when_no_personal_best():
+    """No lap flagged personal-best (e.g. all deleted for track limits, the
+    real VER-at-Monaco-2026 case) must fall back to the lowest non-null
+    LapTime instead of raising."""
+    from app.data import get_lap
+
+    class FakeSession:
+        laps = _FakeLiveLaps(pd.DataFrame({
+            "Driver": ["VER", "VER"],
+            "LapNumber": [1, 2],
+            "LapTime": [pd.Timedelta(seconds=95.0), pd.Timedelta(seconds=90.0)],
+            "IsPersonalBest": [False, False],
+        }))
+
+    lap = get_lap(FakeSession(), "VER", "fastest")
+    assert lap["LapNumber"] == 2

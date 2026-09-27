@@ -348,6 +348,11 @@ def get_lap(session, driver: str, lap: str | int = "fastest"):
         raise DataError(f"No laps for driver {driver}")
     if str(lap) == "fastest":
         out = laps.pick_fastest()
+        if out is None:
+            # No lap marked personal-best (e.g. deleted for a track-limits
+            # violation) -- fall back to the lowest non-null LapTime instead
+            # of giving up (confirmed real case: VER at 2026 Monaco Race).
+            out = laps.pick_fastest(only_by_time=True)
     else:
         match = laps[laps["LapNumber"] == int(lap)]
         out = match.iloc[0] if not match.empty else None
@@ -474,7 +479,7 @@ def _previous_season_corners(session, reference_lap) -> pd.DataFrame | None:
     return c[_CORNER_COLUMNS]
 
 
-def _speed_trace_corners(tel: pd.DataFrame, min_drop_kph: float = 25.0,
+def _speed_trace_corners(tel: pd.DataFrame, min_drop_kph: float = 15.0,
                          prominence_kph: float = 15.0, lookback_m: float = 300.0) -> pd.DataFrame:
     """Estimate corner apexes from local minima in a lap's speed trace —
     the last resort when no circuit map (real or reused) is available at all.
