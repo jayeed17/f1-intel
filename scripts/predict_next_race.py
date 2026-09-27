@@ -32,80 +32,11 @@ from __future__ import annotations
 import argparse
 
 import fastf1
-import numpy as np
 import pandas as pd
 
-from app.config import CIRCUIT_TYPE, PREDICTIONS_DIR, REG_CHANGE_SEASONS
-from app.data import get_session
+from app.config import PREDICTIONS_DIR, RACE_DATASET_PATH
+from app.data import race_prediction_features
 from app.models.race_predictor import ensure_trained, predict_race
-from scripts.build_race_dataset import DATASET_PATH, _team_id
-
-
-def _quali_features(s) -> pd.DataFrame:
-    """One row per driver: driver, team_id, grid (== quali position),
-    quali_position, quali_gap_to_pole_s, teammate_quali_gap_s. grid_pit_lane
-    is always False here -- not knowable until the race actually starts."""
-    laps = s.laps
-    results = s.results
-    best = laps.groupby("Driver")["LapTime"].min().dt.total_seconds()
-    rows = [{
-        "driver": r.get("Abbreviation"), "team_id": _team_id(r.get("TeamName")),
-        "position_raw": r.get("Position"), "quali_best_s": best.get(r.get("Abbreviation"), np.nan),
-    } for _, r in results.iterrows()]
-    df = pd.DataFrame(rows)
-
-    # OpenF1Session never has a real Position (see module docstring) -- rank
-    # by best lap time instead, which is what a quali position fundamentally is.
-    if df["position_raw"].isna().all():
-        df["quali_position"] = df["quali_best_s"].rank(method="first")
-    else:
-        df["quali_position"] = df["position_raw"]
-
-    pole = df["quali_best_s"].min()
-    df["quali_gap_to_pole_s"] = df["quali_best_s"] - pole
-    gap = {}
-    for _, g in df.groupby("team_id"):
-        if len(g) != 2:
-            continue
-        d1, d2 = g.iloc[0], g.iloc[1]
-        gap[d1["driver"]] = d1["quali_best_s"] - d2["quali_best_s"]
-        gap[d2["driver"]] = d2["quali_best_s"] - d1["quali_best_s"]
-    df["teammate_quali_gap_s"] = df["driver"].map(gap)
-    df["grid"] = df["quali_position"]
-    df["grid_pit_lane"] = False
-    return df
-
-
-def _rolling_snapshot(dataset: pd.DataFrame, driver: str, team_id: str) -> dict:
-    """Best-effort 'form entering the next race'. driver_* and
-    team_rolling_avg_finish_3 are recomputed fresh from actual past results
-    (target_finish_pos is saved in the dataset, so this correctly includes
-    each driver/team's most recent race). team_rolling_pace_gap_3 reuses the
-    driver's own most recent pre-race value as-is -- one race stale, since
-    the raw per-race pace gap isn't persisted, only the already-rolled
-    column -- a minor approximation for an inherently approximate exercise.
-    """
-    dh = dataset[dataset["driver"] == driver].sort_values(["season", "round"])
-    th = dataset[dataset["team_id"] == team_id].groupby(["season", "round"])["target_finish_pos"].mean()
-    return {
-        "driver_rolling_avg_finish_3": dh["target_finish_pos"].tail(3).mean() if not dh.empty else np.nan,
-        "driver_rolling_avg_finish_5": dh["target_finish_pos"].tail(5).mean() if not dh.empty else np.nan,
-        "driver_dnf_rate_10": dh["dnf"].tail(10).mean() if not dh.empty else np.nan,
-        "team_rolling_avg_finish_3": th.tail(3).mean() if not th.empty else np.nan,
-        "team_rolling_pace_gap_3": dh["team_rolling_pace_gap_3"].iloc[-1] if not dh.empty else np.nan,
-    }
-
-
-def build_prediction_features(year: int, gp: str, circuit_id: str | None) -> pd.DataFrame:
-    s = get_session(year, gp, "Q", telemetry=False)
-    df = _quali_features(s)
-    dataset = pd.read_parquet(DATASET_PATH)
-    snaps = df.apply(lambda r: _rolling_snapshot(dataset, r["driver"], r["team_id"]),
-                     axis=1, result_type="expand")
-    df = pd.concat([df, snaps], axis=1)
-    df["circuit_type"] = CIRCUIT_TYPE.get(circuit_id, "mixed")
-    df["reg_change_flag"] = year in REG_CHANGE_SEASONS
-    return df
 
 
 def _auto_detect_next_race(now: pd.Timestamp) -> tuple[int, str, str | None] | None:
@@ -150,11 +81,11 @@ def main() -> None:
             return
         year, gp, circuit_id = detected
 
-    if not DATASET_PATH.exists():
-        raise SystemExit(f"No dataset at {DATASET_PATH} -- run scripts/build_race_dataset.py first.")
-    pos_pipe, pts_pipe = ensure_trained(DATASET_PATH)
+    if not RACE_DATASET_PATH.exists():
+        raise SystemExit(f"No dataset at {RACE_DATASET_PATH} -- run scripts/build_race_dataset.py first.")
+    pos_pipe, pts_pipe = ensure_trained(RACE_DATASET_PATH)
 
-    features = build_prediction_features(year, gp, circuit_id)
+    features = race_prediction_features(year, gp, circuit_id)
     preds = predict_race(pos_pipe, pts_pipe, features)
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)

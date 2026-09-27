@@ -44,11 +44,11 @@ import numpy as np
 import pandas as pd
 from fastf1.exceptions import ErgastInvalidRequestError, RateLimitExceededError
 
-from app.config import (CIRCUIT_TYPE, MODEL_DATA_DIR, REG_CHANGE_ROUNDS,
+from app.config import (CIRCUIT_TYPE, MODEL_DATA_DIR, RACE_DATASET_PATH, REG_CHANGE_ROUNDS,
                         REG_CHANGE_SEASONS, TEAM_ID)
 from app.data import PrebuiltSession, _resolve_prebuilt, clean_laps, prebuilt_races
 
-DATASET_PATH = MODEL_DATA_DIR / "race_dataset.parquet"
+DATASET_PATH = RACE_DATASET_PATH  # kept as a local alias; this is the name scripts/tests already use
 _ERGAST = ergast.Ergast()
 
 # jolpica's own server enforces a much tighter rate limit than FastF1's

@@ -6,6 +6,7 @@ MODEL_DIR = ROOT / "models"
 PROCESSED_DIR = ROOT / "data" / "processed"
 PREBUILT_DIR = ROOT / "data" / "prebuilt"
 MODEL_DATA_DIR = ROOT / "data" / "model"
+RACE_DATASET_PATH = MODEL_DATA_DIR / "race_dataset.parquet"
 PREDICTIONS_DIR = ROOT / "predictions"
 
 # Lap-time gain per lap from burning fuel (seconds). Rough public estimate; tune per track.

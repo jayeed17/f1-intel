@@ -14,7 +14,8 @@ import requests
 from fastf1.exceptions import DataNotLoadedError
 from scipy.signal import find_peaks
 
-from app.config import CACHE_DIR, PREBUILT_DIR, PROCESSED_DIR
+from app.config import (CACHE_DIR, CIRCUIT_TYPE, PREBUILT_DIR, PROCESSED_DIR,
+                        RACE_DATASET_PATH, REG_CHANGE_SEASONS, TEAM_ID)
 
 
 def _writable_cache_dir(preferred: Path) -> Path:
@@ -695,6 +696,84 @@ def race_laps(year: int, gp: str | int) -> pd.DataFrame:
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(path)
+    return df
+
+
+# --------------------------------------------------------------------------
+# Race predictor: pre-race feature assembly for an upcoming race's
+# qualifying session (app.models.race_predictor consumes these; kept here,
+# not there, because it needs a live/prebuilt/OpenF1 session -- see the
+# architecture note at the top of this file).
+# --------------------------------------------------------------------------
+
+def _quali_features_for_prediction(s) -> pd.DataFrame:
+    """One row per driver: driver, team_id, grid (== quali position),
+    quali_position, quali_gap_to_pole_s, teammate_quali_gap_s. grid_pit_lane
+    is always False here -- not knowable until the race actually starts."""
+    laps = s.laps
+    results = s.results
+    best = laps.groupby("Driver")["LapTime"].min().dt.total_seconds()
+    rows = [{
+        "driver": r.get("Abbreviation"), "team_id": TEAM_ID.get(r.get("TeamName"), r.get("TeamName")),
+        "position_raw": r.get("Position"), "quali_best_s": best.get(r.get("Abbreviation"), np.nan),
+    } for _, r in results.iterrows()]
+    df = pd.DataFrame(rows)
+
+    # OpenF1Session never has a real Position (no classification endpoint) --
+    # rank by best lap time instead, which is what a quali position is anyway.
+    if df["position_raw"].isna().all():
+        df["quali_position"] = df["quali_best_s"].rank(method="first")
+    else:
+        df["quali_position"] = df["position_raw"]
+
+    pole = df["quali_best_s"].min()
+    df["quali_gap_to_pole_s"] = df["quali_best_s"] - pole
+    gap = {}
+    for _, g in df.groupby("team_id"):
+        if len(g) != 2:
+            continue
+        d1, d2 = g.iloc[0], g.iloc[1]
+        gap[d1["driver"]] = d1["quali_best_s"] - d2["quali_best_s"]
+        gap[d2["driver"]] = d2["quali_best_s"] - d1["quali_best_s"]
+    df["teammate_quali_gap_s"] = df["driver"].map(gap)
+    df["grid"] = df["quali_position"]
+    df["grid_pit_lane"] = False
+    return df
+
+
+def _rolling_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, team_id: str) -> dict:
+    """Best-effort 'form entering the next race'. driver_* and
+    team_rolling_avg_finish_3 are recomputed fresh from actual past results
+    (target_finish_pos is saved in the dataset, so this correctly includes
+    each driver/team's most recent race). team_rolling_pace_gap_3 reuses the
+    driver's own most recent pre-race value as-is -- one race stale, since
+    the raw per-race pace gap isn't persisted, only the already-rolled
+    column -- a minor approximation for an inherently approximate exercise.
+    """
+    dh = dataset[dataset["driver"] == driver].sort_values(["season", "round"])
+    th = dataset[dataset["team_id"] == team_id].groupby(["season", "round"])["target_finish_pos"].mean()
+    return {
+        "driver_rolling_avg_finish_3": dh["target_finish_pos"].tail(3).mean() if not dh.empty else np.nan,
+        "driver_rolling_avg_finish_5": dh["target_finish_pos"].tail(5).mean() if not dh.empty else np.nan,
+        "driver_dnf_rate_10": dh["dnf"].tail(10).mean() if not dh.empty else np.nan,
+        "team_rolling_avg_finish_3": th.tail(3).mean() if not th.empty else np.nan,
+        "team_rolling_pace_gap_3": dh["team_rolling_pace_gap_3"].iloc[-1] if not dh.empty else np.nan,
+    }
+
+
+def race_prediction_features(year: int, gp: str, circuit_id: str | None = None) -> pd.DataFrame:
+    """Pre-race feature row per driver for an upcoming race's qualifying
+    session, in the same shape app.models.race_predictor was trained on.
+    Used by scripts/predict_next_race.py and the /predict/race API route.
+    """
+    s = get_session(year, gp, "Q", telemetry=False)
+    df = _quali_features_for_prediction(s)
+    dataset = pd.read_parquet(RACE_DATASET_PATH)
+    snaps = df.apply(lambda r: _rolling_snapshot_for_prediction(dataset, r["driver"], r["team_id"]),
+                     axis=1, result_type="expand")
+    df = pd.concat([df, snaps], axis=1)
+    df["circuit_type"] = CIRCUIT_TYPE.get(circuit_id, "mixed")
+    df["reg_change_flag"] = year in REG_CHANGE_SEASONS
     return df
 
 
