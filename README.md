@@ -29,6 +29,7 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 | Strategy simulator | Brute-force 1–3 stop plans vs what each driver actually ran, seconds lost vs optimal |
 | Team report | Sector gaps, speed-trap deficit, race pace, pit lane time, auto "where to improve" notes |
 | Tyre ML model | Gradient-boosted model predicting lap-time loss from tyre age, compound, fuel, temps, circuit, validated leave-circuit-out |
+| Race predictor | Predicts finish order + points probability from qualifying (grid, rolling form, team pace, circuit type); walk-forward CV'd against grid/quali baselines — [track record and honest results below](#race-outcome-predictor) |
 
 ## Quickstart
 
@@ -69,8 +70,17 @@ Streamlit Cloud can't reach F1's live timing feed at all, so the dashboard is ba
 | GET | `/{year}/{gp}/strategy?max_stops=2` | `/2025/Monza/strategy` |
 | GET | `/{year}/{gp}/team-report?session=R` | `/2025/Monza/team-report` |
 | POST | `/predict/tyre` | `[{"TyreLife":18,"LapNumber":30,"Compound":"MEDIUM","TrackTemp":42,"Circuit":"Italian Grand Prix"}]` |
+| GET | `/predict/race/{year}/{gp}` | `/predict/race/2025/Monza` |
 
 `gp` accepts an event name (`Monza`, `Italian Grand Prix`) or round number (`16`). `session`: `R`, `Q`, `S`, `SQ`, `FP1`–`FP3`.
+
+## Race outcome predictor
+
+`HistGradientBoosting` position regressor + points classifier, trained on one row per driver per race (2022–2026, `data/model/race_dataset.parquet`, built by `scripts/build_race_dataset.py`) — grid, qualifying gap to pole, rolling driver/team form, team pace gap, DNF rate, circuit type. Evaluated with expanding-window time-based CV (never trains on a future race) against two baselines: **finish = grid** and **finish = qualifying position**.
+
+**Honest result: the model does not currently beat either baseline.** Grid position alone is a very strong predictor of finish position in F1, and a model trained on ~2,100 rows doesn't have enough signal to beat it yet — see `app/models/race_predictor.py`'s module docstring and the dashboard's "Season track record" chart for the actual per-season numbers. It's still useful as a probability-of-points estimate and a live track record (`predictions/{year}.csv`, scored weekly), just not (yet) as a better position predictor than "grid stays put."
+
+Weekly predictions are logged automatically: `scripts/predict_next_race.py` runs after qualifying (Saturday 20:00 UTC) and appends to `predictions/{year}.csv`; `scripts/score_predictions.py` runs after the race (Monday) and fills in actual results. Both fail loudly (non-zero exit) if expected data is missing rather than silently doing nothing.
 
 ## Method notes and limits
 
@@ -87,15 +97,20 @@ app/
   config.py            constants (fuel effect, pit loss, thresholds)
   data.py              session loading, caching, lap/telemetry helpers, JSON serialisation
   analysis/            braking.py, delta.py, pits.py, team_report.py
-  models/              degradation.py, strategy.py, tyre_ml.py
+  models/              degradation.py, strategy.py, tyre_ml.py, race_predictor.py
 dashboard/streamlit_app.py
 scripts/train_tyre_model.py
 scripts/smoke_test.py   exercises every route's functions against a real session
 scripts/build_prebuilt.py   builds data/prebuilt/ (run locally or by the update-data Action)
+scripts/build_race_dataset.py   builds data/model/race_dataset.parquet (run locally, not by any Action)
+scripts/predict_next_race.py   logs a prediction row per driver to predictions/{year}.csv (Action: Saturday 20:00 UTC)
+scripts/score_predictions.py   fills in actual results once a race is over (Action: Monday)
 tests/                 offline tests on synthetic data
 data/processed/{year}/{round}.parquet   Parquet cache for live-loaded races (gitignored)
 data/prebuilt/{year}/{round}/{session}/   committed prebuilt bundle: laps/results/corners/telemetry parquet + manifest.json
-.github/workflows/update-data.yml   rebuilds data/prebuilt/ twice a week
+data/model/race_dataset.parquet   committed race-predictor training set, one row per driver per race
+predictions/{year}.csv   committed public track record of weekly predictions vs actual results
+.github/workflows/update-data.yml   rebuilds data/prebuilt/ twice a week; scores/predicts races on its own cron
 docs/img/              README screenshots
 ```
 
