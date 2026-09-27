@@ -576,3 +576,42 @@ def test_get_lap_falls_back_to_lowest_laptime_when_no_personal_best():
 
     lap = get_lap(FakeSession(), "VER", "fastest")
     assert lap["LapNumber"] == 2
+
+
+def test_session_missing_reads_manifest_status(monkeypatch):
+    """Dashboard gating: session_missing() must surface a partial session's
+    missing fields so the UI can show a friendly message instead of crashing
+    on lap_telemetry(), and return [] for a complete or absent session."""
+    from app import data as data_mod
+
+    fake_manifest = [
+        {"year": 2026, "name": "Azerbaijan Grand Prix", "sessions": ["R"],
+         "session_status": {"R": {"source": "openf1", "status": "partial",
+                                   "missing": ["telemetry", "corners"]}}},
+        {"year": 2026, "name": "Italian Grand Prix", "sessions": ["R"],
+         "session_status": {"R": {"source": "fastf1", "status": "complete", "missing": []}}},
+    ]
+    monkeypatch.setattr(data_mod, "_prebuilt_manifest", lambda: fake_manifest)
+
+    assert data_mod.session_missing(2026, "Azerbaijan Grand Prix", "R") == ["telemetry", "corners"]
+    assert data_mod.session_missing(2026, "Italian Grand Prix", "R") == []
+    assert data_mod.session_missing(2026, "Nonexistent Grand Prix", "R") == []
+
+
+def test_build_prebuilt_classify_missing_and_upgrade():
+    """build_prebuilt.py's partial/complete classification and the
+    --only-missing retry logic that upgrades a partial session once a source
+    recovers full data."""
+    from scripts.build_prebuilt import _classify_missing, _is_missing_or_partial
+
+    assert _classify_missing(written=0, driver_count=22, corner_count=0) == ["telemetry", "corners"]
+    assert _classify_missing(written=22, driver_count=22, corner_count=19) == []
+    assert _classify_missing(written=0, driver_count=0, corner_count=19) == []  # no drivers to try at all
+
+    absent = {"sessions": [], "session_status": {}}
+    partial = {"sessions": ["R"], "session_status": {"R": {"status": "partial", "missing": ["telemetry"]}}}
+    complete = {"sessions": ["R"], "session_status": {"R": {"status": "complete", "missing": []}}}
+
+    assert _is_missing_or_partial("R", absent) is True
+    assert _is_missing_or_partial("R", partial) is True
+    assert _is_missing_or_partial("R", complete) is False  # upgraded -> no longer rebuilt

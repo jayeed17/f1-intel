@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import sys
 import time
 
 import fastf1
@@ -19,7 +21,7 @@ import pandas as pd
 from fastf1.exceptions import RateLimitExceededError
 
 from app.config import PREBUILT_DIR
-from app.data import SessionLoadError
+from app.data import OpenF1Error, OpenF1Session, SessionLoadError
 from app.data import corners as compute_corners
 from app.data import get_lap, lap_telemetry, load_session
 
@@ -131,18 +133,54 @@ def event_sessions(row: pd.Series) -> list[str]:
     return codes
 
 
-def build_session(year: int, gp: str, round_number: int, session: str) -> int | None:
-    """Build one session's parquet files. Returns driver count on success,
-    None if the session couldn't be loaded at all (skipped, not fatal)."""
+def _classify_missing(written: int, driver_count: int, corner_count: int) -> list[str]:
+    """What a session is missing after a build attempt -- "telemetry" if no
+    driver got any (and there were drivers to try), "corners" if the corner
+    map came back empty. A session with anything missing is "partial" rather
+    than "complete" in the manifest."""
+    missing = []
+    if driver_count > 0 and written == 0:
+        missing.append("telemetry")
+    if corner_count == 0:
+        missing.append("corners")
+    return missing
+
+
+def _is_missing_or_partial(session_code: str, existing: dict) -> bool:
+    """Whether a session should be (re)built under --only-missing: either
+    it's not in the manifest at all, or it's there but marked partial (so
+    every run keeps retrying it until a source recovers full data)."""
+    if session_code not in existing.get("sessions", []):
+        return True
+    return existing.get("session_status", {}).get(session_code, {}).get("status") == "partial"
+
+
+def build_session(year: int, gp: str, round_number: int,
+                  session: str) -> tuple[int, str, list[str]] | tuple[None, None, None]:
+    """Build one session's parquet files. Returns (driver count, source
+    ("fastf1" or "openf1"), missing) on success -- missing is [] for a fully
+    complete build, or e.g. ["telemetry", "corners"] for a partial one (see
+    _classify_missing). Returns (None, None, None) if the session couldn't be
+    loaded from either source at all (skipped, not fatal)."""
     out_dir = PREBUILT_DIR / str(year) / str(round_number) / session
     s, failure = _load_with_diagnosis(year, gp, round_number, session)
+    source = "fastf1"
     if failure is not None:
         category, detail = failure
         print(f"  ! {_FAILURE_LABELS[category]}: {year} {gp} {session}: {detail}")
-        return None
+        print(f"  -> trying OpenF1 for {year} {gp} {session}")
+        try:
+            s = OpenF1Session(year, gp, session)
+            source = "openf1"
+        except OpenF1Error as e:
+            print(f"  ! OPENF1 ALSO FAILED: {year} {gp} {session}: {e}")
+            return None, None, None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     laps = pd.DataFrame(s.laps)
+    if source == "openf1":
+        # internal OpenF1Session bookkeeping columns -- don't leak into the bundle
+        laps = laps.drop(columns=[c for c in ("_driver_number", "_date_start") if c in laps.columns])
     laps.to_parquet(out_dir / "laps.parquet")
 
     try:
@@ -173,9 +211,11 @@ def build_session(year: int, gp: str, round_number: int, session: str) -> int | 
         tel.to_parquet(tel_dir / f"{drv}.parquet")
         written += 1
 
-    print(f"  {gp} {session}: laps={len(laps)} results={len(results)} corners={len(cn)} "
+    missing = _classify_missing(written, len(drivers), len(cn))
+    status = "partial" if missing else "complete"
+    print(f"  {gp} {session} [{source}, {status}]: laps={len(laps)} results={len(results)} corners={len(cn)} "
           f"telemetry={written}/{len(drivers)} drivers")
-    return written
+    return written, source, missing
 
 
 def downsample_telemetry() -> None:
@@ -187,6 +227,38 @@ def downsample_telemetry() -> None:
 
 def total_size_bytes() -> int:
     return sum(f.stat().st_size for f in PREBUILT_DIR.rglob("*") if f.is_file())
+
+
+def missing_completed_sessions(manifest: dict[tuple[int, str], dict], years: list[int],
+                               wanted_sessions: list[str], now: pd.Timestamp) -> list[tuple[int, str, str]]:
+    """(year, gp, session_code) triples whose scheduled session time is more
+    than 6h in the past (comfortably longer than any session itself takes, so
+    it should certainly be over and published by then) but that are still
+    missing from the manifest after this run -- i.e. neither FastF1 nor
+    OpenF1 could build them. Used to make the Action fail loudly instead of
+    silently leaving stale data, per race weekend."""
+    missing = []
+    for year in years:
+        try:
+            sch = fastf1.get_event_schedule(year, include_testing=False)
+        except Exception:  # noqa: BLE001 -- schedule itself unreachable; can't judge, skip
+            continue
+        for _, row in sch.iterrows():
+            gp = row["EventName"]
+            built = manifest.get((year, gp), {}).get("sessions", [])
+            for i in range(1, 6):
+                code = _SESSION_NAME_TO_CODE.get(row.get(f"Session{i}"))
+                if not code or code not in wanted_sessions or code in built:
+                    continue
+                session_time = row.get(f"Session{i}DateUtc")
+                if pd.isna(session_time):
+                    continue
+                session_time = pd.Timestamp(session_time)
+                if session_time.tzinfo is None:
+                    session_time = session_time.tz_localize("UTC")
+                if now - session_time > pd.Timedelta(hours=6):
+                    missing.append((year, gp, code))
+    return missing
 
 
 def main() -> None:
@@ -225,18 +297,23 @@ def main() -> None:
 
             key = (year, gp)
             existing = manifest.get(key, {"year": year, "round": round_number, "name": gp,
-                                          "sessions": [], "built_at": None})
+                                          "sessions": [], "session_status": {}, "built_at": None})
+            existing.setdefault("session_status", {})
             to_build = available
             if args.only_missing and not args.force:
-                to_build = [c for c in available if c not in existing["sessions"]]
+                to_build = [c for c in available if _is_missing_or_partial(c, existing)]
                 if not to_build:
                     continue
 
             print(f"{year} {gp} (round {round_number}): building {to_build}")
             built_now = []
             for session in to_build:
-                if build_session(year, gp, round_number, session) is not None:
+                written, source, missing = build_session(year, gp, round_number, session)
+                if written is not None:
                     built_now.append(session)
+                    existing["session_status"][session] = {
+                        "source": source, "status": "partial" if missing else "complete", "missing": missing,
+                    }
 
             if built_now:
                 existing["sessions"] = sorted(set(existing["sessions"]) | set(built_now))
@@ -251,6 +328,35 @@ def main() -> None:
         downsample_telemetry()
         new_size = total_size_bytes()
         print(f"New size after downsampling: {new_size / 1024 / 1024:.2f} MB")
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+    partial = [
+        (yr, race["name"], code, st["missing"])
+        for (yr, _name), race in manifest.items() if yr in args.year
+        for code, st in race.get("session_status", {}).items() if st.get("status") == "partial"
+    ]
+    if partial:
+        lines = [f"- {y} {gp} {code}: missing {', '.join(miss)}" for y, gp, code, miss in sorted(partial)]
+        warning = ("## Partial prebuilt sessions\n\nThese only have laps/results (built from a "
+                  "degraded source) and will keep being retried on every future run until a "
+                  "source recovers the rest:\n\n" + "\n".join(lines) + "\n")
+        print("\n" + warning)
+        if summary_path:
+            with open(summary_path, "a") as f:
+                f.write(warning)
+
+    missing = missing_completed_sessions(manifest, args.year, wanted_sessions, now)
+    if missing:
+        lines = [f"- {year} {gp} {code}" for year, gp, code in missing]
+        summary = ("## Missing prebuilt sessions\n\nThese sessions' scheduled time is "
+                    "more than 6h in the past but they're still absent from the manifest "
+                    "(FastF1 and OpenF1 both failed to build them):\n\n" + "\n".join(lines) + "\n")
+        print("\n" + summary)
+        if summary_path:
+            with open(summary_path, "a") as f:
+                f.write(summary)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

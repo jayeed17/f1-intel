@@ -20,7 +20,8 @@ from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
                       get_lap, get_session, has_position_data, lap_telemetry,
-                      load_session, prebuilt_built_at, prebuilt_races, race_laps)
+                      load_session, prebuilt_built_at, prebuilt_races, race_laps,
+                      session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
@@ -85,7 +86,14 @@ built_at = prebuilt_built_at(year, gp)
 if built_at:
     st.caption(f"Data updated: {built_at}")
 
+_TELEMETRY_UNAVAILABLE_MSG = "Telemetry for this session isn't available yet — it'll be added automatically."
+
+
 def render_view() -> None:
+    if view in TELEMETRY_VIEWS and "telemetry" in session_missing(int(year), gp, kind):
+        st.info(_TELEMETRY_UNAVAILABLE_MSG)
+        return
+
     if view == "Braking":
         s = session_full(int(year), gp, kind)
         drivers = sorted(s.laps["Driver"].dropna().unique())

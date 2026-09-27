@@ -93,6 +93,18 @@ def prebuilt_built_at(year: int, gp: str) -> str | None:
     return None
 
 
+def session_missing(year: int, gp: str, session: str) -> list[str]:
+    """What a prebuilt session is still missing per the manifest's
+    session_status (e.g. ["telemetry", "corners"] for a session that could
+    only be built from a degraded source, like OpenF1 without car data).
+    Empty for a complete session, one not in the manifest, or an older
+    manifest entry predating this field."""
+    for r in _prebuilt_manifest():
+        if r["year"] == year and r["name"].lower() == str(gp).lower():
+            return r.get("session_status", {}).get(session, {}).get("missing", [])
+    return []
+
+
 def _resolve_prebuilt(year: int, gp: str | int, session: str) -> tuple[int, int] | None:
     gp_norm = _gp(gp)
     for r in _prebuilt_manifest():
@@ -188,6 +200,7 @@ class OpenF1Session:
         meta = _openf1_find_session(year, gp, session)
         self.session_key = meta["session_key"]
         self.year = year
+        self.gp = gp
         self.session_code = session
         self._corners = pd.DataFrame(columns=_CORNER_COLUMNS)
 
@@ -422,6 +435,61 @@ def _lap_length(lap) -> float | None:
         return None
 
 
+def _reuse_prebuilt_corners(prev_year: int, gp_name: str, session_code: str,
+                            this_len: float) -> pd.DataFrame | None:
+    """Reuse a previous season's already-built corner map from the prebuilt
+    bundle, only if its lap length is within 1% of this_len — guards against
+    reusing stale geometry after a circuit redesign. None if that season
+    isn't bundled, has no corners itself, or the lengths don't match closely
+    enough. Shared by the live-FastF1 and OpenF1 corner-fallback chains.
+    """
+    prebuilt = _resolve_prebuilt(prev_year, gp_name, session_code)
+    if prebuilt is None:
+        return None
+    prev_session = PrebuiltSession(*prebuilt, session_code)
+    prev_cn = prev_session._corners
+    if prev_cn.empty:
+        return None
+    prev_len = None
+    for f in sorted(prev_session._telemetry_dir.glob("*.parquet")):
+        d = pd.read_parquet(f, columns=["Distance"])
+        if not d.empty:
+            prev_len = float(d["Distance"].max())
+            break
+    if not prev_len or abs(this_len - prev_len) / prev_len > 0.01:
+        return None
+    c = prev_cn.copy()
+    if "Estimated" not in c.columns:
+        c["Estimated"] = False
+    return c[[col for col in _CORNER_COLUMNS if col in c.columns]]
+
+
+def _openf1_corners(session: "OpenF1Session") -> pd.DataFrame:
+    """Corner fallback for an OpenF1-sourced session. OpenF1 exposes no
+    circuit-map endpoint at all, so this skips straight to tiers 2/3: reuse
+    last season's prebuilt map (gated on lap length within 1%), else estimate
+    from the fastest available driver's speed trace.
+    """
+    tel = None
+    for drv in sorted(session.laps["Driver"].dropna().unique()):
+        try:
+            tel = lap_telemetry(get_lap(session, drv, "fastest"))
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if tel is None or tel.empty:
+        return pd.DataFrame(columns=_CORNER_COLUMNS)
+
+    this_len = float(tel["Distance"].max())
+    reused = _reuse_prebuilt_corners(session.year - 1, session.gp, session.session_code, this_len)
+    if reused is not None:
+        return reused.sort_values("Distance").reset_index(drop=True)
+    try:
+        return _speed_trace_corners(tel)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=_CORNER_COLUMNS)
+
+
 def _previous_season_corners(session, reference_lap) -> pd.DataFrame | None:
     """Reuse the same event's corner map from last season, only if this
     session's lap length is within 1% of last season's — guards against
@@ -441,21 +509,9 @@ def _previous_season_corners(session, reference_lap) -> pd.DataFrame | None:
     session_code = _SESSION_NAME_TO_CODE.get(session.name)
 
     if session_code:
-        prebuilt = _resolve_prebuilt(prev_year, gp_name, session_code)
-        if prebuilt is not None:
-            prev_session = PrebuiltSession(*prebuilt, session_code)
-            prev_cn = prev_session._corners
-            prev_len = None
-            for f in sorted(prev_session._telemetry_dir.glob("*.parquet")):
-                d = pd.read_parquet(f, columns=["Distance"])
-                if not d.empty:
-                    prev_len = float(d["Distance"].max())
-                    break
-            if not prev_cn.empty and prev_len and abs(this_len - prev_len) / prev_len <= 0.01:
-                c = prev_cn.copy()
-                if "Estimated" not in c.columns:
-                    c["Estimated"] = False
-                return c[[col for col in _CORNER_COLUMNS if col in c.columns]]
+        reused = _reuse_prebuilt_corners(prev_year, gp_name, session_code, this_len)
+        if reused is not None:
+            return reused
 
     try:
         prev = fastf1.get_session(prev_year, gp_name, session.name)
@@ -531,14 +587,16 @@ def corners(session) -> pd.DataFrame:
        still needs to place last year's geometry using this session's own
        telemetry).
 
-    Prebuilt/OpenF1 sessions just return whichever of the above was baked in
-    at build time (OpenF1 sessions never get further than an empty frame —
-    no position feed at all to place a real map against, and no build step
-    to have pre-computed tier 3 either).
+    Prebuilt sessions just return whichever of the above was baked in at
+    build time. OpenF1 sessions have no circuit-map endpoint at all (tier 1
+    never applies), so they run tiers 2/3 live via _openf1_corners() instead
+    of the FastF1-Lap-specific code below.
     """
-    if isinstance(session, (PrebuiltSession, OpenF1Session)):
+    if isinstance(session, PrebuiltSession):
         cn = session._corners
         return cn if "Estimated" in cn.columns else cn.assign(Estimated=False)
+    if isinstance(session, OpenF1Session):
+        return _openf1_corners(session)
 
     try:
         reference_lap = session.laps.pick_fastest()
