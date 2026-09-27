@@ -2,13 +2,17 @@ name: Update prebuilt race data
 
 on:
   schedule:
-    # Monday and Sunday, 02:00 UTC (a few hours after most race weekends wrap up)
-    - cron: "0 2 * * 1,0"
+    # Monday 02:00 UTC covers essentially every race (latest Sunday finish is
+    # ~22:00 UTC); Monday 14:00 UTC is a second pass for anything F1/OpenF1
+    # hadn't published yet by the first run (--only-missing makes this cheap).
+    - cron: "0 2 * * 1"
+    - cron: "0 14 * * 1"
   workflow_dispatch: {}
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:

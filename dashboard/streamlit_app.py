@@ -114,12 +114,12 @@ def render_view() -> None:
             fig.add_annotation(x=c["Distance"], y=tel["Speed"].max() + 10, text=label, showarrow=False, font_size=10)
         fig.update_layout(template=TEMPLATE, height=450, xaxis_title="Distance (m)", yaxis_title="kph",
                           title=f"{drv} lap {int(lap['LapNumber'])} ({lap['LapTime'].total_seconds():.3f}s) · red = braking")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         if not has_position_data(tel):
             st.caption("No track position data for this session — corner labels are placed by distance only.")
         if cn.get("Estimated", pd.Series(dtype=bool)).any():
             st.caption("Corners marked (est.) are estimated from the speed trace, not an official track map.")
-        st.dataframe(zones, use_container_width=True, hide_index=True)
+        st.dataframe(zones, width="stretch", hide_index=True)
 
     elif view == "Head to head":
         s = session_full(int(year), gp, kind)
@@ -142,7 +142,7 @@ def render_view() -> None:
         fig.update_yaxes(title_text="kph", row=1, col=1)
         fig.update_yaxes(title_text="throttle %", row=2, col=1)
         fig.update_yaxes(title_text="gap (s)", row=3, col=1)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.subheader("Corner by corner (positive diff = B higher / brakes later)")
         cn = corners(s)
         comp = compare_corners(ta, tb, cn)
@@ -150,7 +150,7 @@ def render_view() -> None:
             comp = comp.merge(cn[["Label", "Estimated"]].rename(columns={"Label": "corner"}), on="corner", how="left")
         if cn.get("Estimated", pd.Series(dtype=bool)).any():
             st.caption("Corners marked Estimated=True are estimated from the speed trace, not an official track map.")
-        st.dataframe(comp, use_container_width=True, hide_index=True)
+        st.dataframe(comp, width="stretch", hide_index=True)
 
     elif view == "Track dominance":
         s = session_full(int(year), gp, kind)
@@ -169,7 +169,7 @@ def render_view() -> None:
             fig.update_yaxes(scaleanchor="x", visible=False)
             fig.update_xaxes(visible=False)
             fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.write(pts.groupby("Winner")["Minisector"].nunique().rename("minisectors won"))
         else:
             st.info("Pick at least 2 drivers to compare.")
@@ -183,11 +183,11 @@ def render_view() -> None:
         fig = px.scatter(cl, x="TyreLife", y="LapTimeS", color="Compound", hover_data=["Driver", "LapNumber"],
                          color_discrete_map=COMPOUND_COLORS, template=TEMPLATE)
         fig.update_layout(height=450, yaxis_title="lap time (s)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.subheader("Compound model (fuel-corrected, relative to driver median)")
         st.json(compound_model(cl))
         st.subheader("Per stint")
-        st.dataframe(stint_degradation(cl).sort_values("DegPerLap"), use_container_width=True, hide_index=True)
+        st.dataframe(stint_degradation(cl).sort_values("DegPerLap"), width="stretch", hide_index=True)
 
     elif view == "Strategy":
         laps = cached_race_laps(int(year), gp)
@@ -201,14 +201,14 @@ def render_view() -> None:
         else:
             sims = simulate(total, model, loss)
             st.subheader("Model-optimal strategies")
-            st.dataframe(sims, use_container_width=True, hide_index=True)
+            st.dataframe(sims, width="stretch", hide_index=True)
             act = compare_actual(laps, total, model, loss, float(sims["total_s"].iloc[0]))
             if not act.empty:
                 fig = px.bar(act, x="Driver", y="lost_vs_optimal_s", color="Team", hover_data=["plan"], template=TEMPLATE)
                 fig.update_layout(height=400, yaxis_title="seconds lost vs optimal (model)")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             st.subheader("Pit stops")
-            st.dataframe(stops, use_container_width=True, hide_index=True)
+            st.dataframe(stops, width="stretch", hide_index=True)
 
     elif view == "Team report":
         laps = cached_race_laps(int(year), gp)
@@ -216,12 +216,12 @@ def render_view() -> None:
         if rep.empty:
             st.warning("No team data for this race.")
             return
-        st.dataframe(rep, use_container_width=True, hide_index=True)
+        st.dataframe(rep, width="stretch", hide_index=True)
         gap_cols = [c for c in ["s1_gap", "s2_gap", "s3_gap"] if c in rep]
         long = rep.melt(id_vars="Team", value_vars=gap_cols, var_name="sector", value_name="gap_s")
         fig = px.bar(long, x="Team", y="gap_s", color="sector", barmode="group", template=TEMPLATE)
         fig.update_layout(height=420, yaxis_title="gap to best sector (s)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 try:

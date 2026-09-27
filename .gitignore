@@ -9,3 +9,4 @@ models/*.json
 .pytest_cache/
 .DS_Store
 models/*.csv
+.claude/
