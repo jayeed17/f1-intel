@@ -5,8 +5,12 @@ on:
     # Monday 02:00 UTC covers essentially every race (latest Sunday finish is
     # ~22:00 UTC); Monday 14:00 UTC is a second pass for anything F1/OpenF1
     # hadn't published yet by the first run (--only-missing makes this cheap).
+    # Both Monday runs also score last weekend's race predictions.
     - cron: "0 2 * * 1"
     - cron: "0 14 * * 1"
+    # Saturday 20:00 UTC: qualifying has finished for essentially every race
+    # format by then -- log a race-outcome prediction before Sunday's race.
+    - cron: "0 20 * * 6"
   workflow_dispatch: {}
 
 jobs:
@@ -34,13 +38,22 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Build missing prebuilt data
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 20 * * 6'
         run: python -m scripts.build_prebuilt --year 2026 --only-missing
+
+      - name: Score predictions
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 20 * * 6'
+        run: python -m scripts.score_predictions --year 2026
+
+      - name: Predict next race
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        run: python -m scripts.predict_next_race
 
       - name: Commit and push if data changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/prebuilt
+          git add data/prebuilt predictions
           if git diff --cached --quiet; then
             echo "No data changes."
           else

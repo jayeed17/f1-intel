@@ -205,12 +205,23 @@ def evaluate(df: pd.DataFrame, min_train_races: int = 20) -> tuple[pd.DataFrame,
 # Final fit (all data) + single-race prediction, for the API/dashboard.
 # --------------------------------------------------------------------------
 
-def train(df: pd.DataFrame) -> dict:
+def fit_final(df: pd.DataFrame) -> tuple[Pipeline, Pipeline]:
+    """Fit position + points pipelines on ALL of df -- no CV/holdout. This is
+    the model actually used for real predictions, as opposed to the
+    walk-forward copies fit inside evaluate() purely for honest metrics."""
     train_pos = df.dropna(subset=[TARGET_POS])
     train_pts = df.dropna(subset=[TARGET_PTS])
     pos_pipe = make_position_pipeline().fit(_prep(train_pos), train_pos[TARGET_POS])
     pts_pipe = make_points_pipeline().fit(_prep(train_pts), train_pts[TARGET_PTS])
+    return pos_pipe, pts_pipe
 
+
+def train(df: pd.DataFrame) -> dict:
+    """Fit the final model, run the full walk-forward evaluation for honest
+    metrics, and cache everything to disk. Slow (many CV folds -- see
+    evaluate()); use ensure_trained() instead when a caller just needs a
+    usable model quickly (predictions, the API, the dashboard)."""
+    pos_pipe, pts_pipe = fit_final(df)
     _, metrics = evaluate(df)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(pos_pipe, MODEL_POS_PATH)
@@ -223,6 +234,24 @@ def load_models():
     if not (MODEL_POS_PATH.exists() and MODEL_PTS_PATH.exists()):
         return None, None
     return joblib.load(MODEL_POS_PATH), joblib.load(MODEL_PTS_PATH)
+
+
+def ensure_trained(dataset_path) -> tuple[Pipeline, Pipeline]:
+    """Load cached models if present, else fit fresh from the dataset at
+    dataset_path (fast -- no walk-forward evaluation) and cache the result.
+    Models are gitignored (regenerable, not source), so every consumer --
+    the predict script, the API, the dashboard -- can be self-sufficient
+    from just the small committed dataset parquet, with no pre-committed
+    model artifact needed anywhere (local dev, CI, or Streamlit Cloud)."""
+    pos_pipe, pts_pipe = load_models()
+    if pos_pipe is not None:
+        return pos_pipe, pts_pipe
+    df = pd.read_parquet(dataset_path)
+    pos_pipe, pts_pipe = fit_final(df)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pos_pipe, MODEL_POS_PATH)
+    joblib.dump(pts_pipe, MODEL_PTS_PATH)
+    return pos_pipe, pts_pipe
 
 
 def predict_race(pos_pipe, pts_pipe, race_features: pd.DataFrame) -> pd.DataFrame:
