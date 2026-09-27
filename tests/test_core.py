@@ -314,6 +314,13 @@ def test_prebuilt_races_render_all_views_offline(monkeypatch):
     for race in sample:
         year, gp = race["year"], race["name"]
         for session in race["sessions"]:
+            # A session built from a degraded source (e.g. OpenF1 without car
+            # data) is legitimately telemetry-less -- that's what the
+            # dashboard's session_missing() check is for; skip the
+            # telemetry-dependent views here the same way it does.
+            if "telemetry" in data_mod.session_missing(year, gp, session):
+                continue
+
             s = data_mod.get_session(year, gp, session)
             drivers = sorted(s.laps["Driver"].dropna().unique())
             assert len(drivers) >= 2
