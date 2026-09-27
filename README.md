@@ -18,8 +18,6 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 |---|---|
 | ![Track dominance](docs/img/dominance.png) | ![Strategy simulator](docs/img/strategy.png) |
 
-*(placeholders above — swap in real captures from your deployed dashboard)*
-
 ## Features
 
 | Module | What it answers |
