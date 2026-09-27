@@ -6,7 +6,7 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 
 ## Live demo
 
-**[TODO: paste your Streamlit Community Cloud URL here, e.g. https://f1-intel.streamlit.app]**
+**[f1-intel.streamlit.app](https://f1-intel.streamlit.app/)**
 
 ## Screenshots
 
