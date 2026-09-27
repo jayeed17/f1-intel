@@ -115,9 +115,9 @@ def fake_race(n_drivers=4, laps=50, pit=25):
             lt = base + deg * life - 0.035 * (lap - 1)
             rows.append({"Driver": f"D{i}", "Team": f"T{i}", "LapNumber": lap, "Stint": stint,
                          "Compound": comp, "TyreLife": life, "LapTimeS": lt,
-                         "LapTime": pd.Timedelta(seconds=lt + (20 if lap in (pit, pit + 1) else 0)),
-                         "PitInTime": pd.Timedelta(seconds=1000) if lap == pit else pd.NaT,
-                         "PitOutTime": pd.Timedelta(seconds=1022) if lap == pit + 1 else pd.NaT})
+                         "LapTime": pd.to_timedelta(lt + (20 if lap in (pit, pit + 1) else 0), unit="s"),
+                         "PitInTime": pd.to_timedelta(1000, unit="s") if lap == pit else pd.NaT,
+                         "PitOutTime": pd.to_timedelta(1022, unit="s") if lap == pit + 1 else pd.NaT})
     return pd.DataFrame(rows)
 
 
@@ -182,7 +182,7 @@ def test_clean_laps_from_dataframe():
              IsAccurate=True, TyreLife=5, Compound="MEDIUM"),
         dict(LapTime=83.0, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="1",
              IsAccurate=True, TyreLife=6, Compound="MEDIUM"),
-        dict(LapTime=84.0, PitInTime=pd.Timedelta(seconds=1000), PitOutTime=pd.NaT,
+        dict(LapTime=84.0, PitInTime=pd.to_timedelta(1000, unit="s"), PitOutTime=pd.NaT,
              TrackStatus="1", IsAccurate=True, TyreLife=7, Compound="MEDIUM"),  # pit lap
         dict(LapTime=84.5, PitInTime=pd.NaT, PitOutTime=pd.NaT, TrackStatus="4",
              IsAccurate=True, TyreLife=8, Compound="MEDIUM"),  # not green flag
@@ -192,7 +192,7 @@ def test_clean_laps_from_dataframe():
              IsAccurate=True, TyreLife=10, Compound="MEDIUM"),  # slower than 107%
     ]
     df = pd.DataFrame(rows)
-    df["LapTime"] = df["LapTime"].apply(lambda s: pd.Timedelta(seconds=s))
+    df["LapTime"] = df["LapTime"].apply(lambda s: pd.to_timedelta(s, unit="s"))
     clean = clean_laps(df)
     assert sorted(clean["TyreLife"].tolist()) == [5, 6]
     assert set(clean["LapTimeS"].round(1)) == {82.0, 83.0}
@@ -577,7 +577,7 @@ def test_get_lap_falls_back_to_lowest_laptime_when_no_personal_best():
         laps = _FakeLiveLaps(pd.DataFrame({
             "Driver": ["VER", "VER"],
             "LapNumber": [1, 2],
-            "LapTime": [pd.Timedelta(seconds=95.0), pd.Timedelta(seconds=90.0)],
+            "LapTime": [pd.to_timedelta(95.0, unit="s"), pd.to_timedelta(90.0, unit="s")],
             "IsPersonalBest": [False, False],
         }))
 

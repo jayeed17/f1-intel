@@ -220,7 +220,7 @@ class OpenF1Session:
         pit_keys = {(p["driver_number"], p["lap_number"]) for p in pits}
 
         def _td(seconds):
-            return pd.Timedelta(seconds=seconds) if seconds is not None else pd.NaT
+            return pd.to_timedelta(seconds, unit="s") if seconds is not None else pd.NaT
 
         rows = []
         for lap in laps_raw:
@@ -254,7 +254,7 @@ class OpenF1Session:
 
     def lap_telemetry(self, driver_number: int, date_start: str, duration: float) -> pd.DataFrame:
         start = pd.Timestamp(date_start)
-        end = start + pd.Timedelta(seconds=(duration or 0) + 1)
+        end = start + pd.to_timedelta((duration or 0) + 1, unit="s")
         car = _openf1_get("car_data", session_key=self.session_key, driver_number=driver_number,
                           **{"date>=": start.isoformat(), "date<=": end.isoformat()})
         if not car:
