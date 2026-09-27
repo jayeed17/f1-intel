@@ -39,6 +39,15 @@ def _prep(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
     for c in NUM:
         X[c] = pd.to_numeric(X[c], errors="coerce").astype(float) if c in X else np.nan
+        if X[c].notna().sum() == 0:
+            # HistGradientBoosting's binning code (sklearn >=1.5-ish) raises
+            # "window shape cannot be larger than input array shape" on a
+            # column with zero non-missing values -- confirmed live: early
+            # walk-forward folds train on 2022-only rows, where
+            # team_rolling_pace_gap_3 is *always* NaN (prebuilt-only
+            # feature). A fully-missing column carries no signal either way,
+            # so filling with a constant costs nothing predictively.
+            X[c] = 0.0
     for c in BOOL:
         X[c] = X[c].fillna(False).astype(float) if c in X else 0.0
     for c in CAT:

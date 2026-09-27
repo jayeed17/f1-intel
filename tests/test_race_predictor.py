@@ -101,6 +101,23 @@ def test_predict_race_ranks_single_race():
     assert list(out["predicted_position"]) == list(out["predicted_position"].sort_values())
 
 
+def test_prep_handles_all_nan_numeric_column():
+    """Regression test: an entirely-NaN numeric feature (e.g.
+    team_rolling_pace_gap_3 in an early walk-forward fold trained only on
+    seasons that predate it) must not crash HistGradientBoosting's binning.
+    Confirmed live on sklearn 1.9.1: fitting on a column with 0 distinct
+    non-null values raises "window shape cannot be larger than input array
+    shape" inside sklearn's own _find_binning_thresholds. _prep() fills a
+    fully-missing numeric column with 0.0 (zero variance either way, so this
+    changes nothing predictively) specifically to avoid that crash."""
+    df = fake_race_dataset(n_seasons=1, n_rounds=6, n_drivers=14)
+    df["team_rolling_pace_gap_3"] = np.nan  # simulate the all-missing case
+    X = _prep(df)
+    assert X["team_rolling_pace_gap_3"].notna().all()
+    pipe = make_position_pipeline().fit(X, df[TARGET_POS])
+    pipe.predict(X)  # must not raise
+
+
 def test_train_writes_model_and_metrics(tmp_path, monkeypatch):
     from app.models import race_predictor as rp
 

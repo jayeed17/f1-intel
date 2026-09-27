@@ -12,10 +12,13 @@ from app.analysis.braking import assign_corners, braking_zones, compare_corners
 from app.analysis.delta import lap_delta, minisector_dominance
 from app.analysis.pits import estimate_pit_loss, pit_stops
 from app.analysis.team_report import team_report
+from app.config import RACE_DATASET_PATH
 from app.data import (DataError, clean_laps, corners, get_lap, has_position_data,
-                      lap_telemetry, load_session, race_laps, to_records)
+                      lap_telemetry, load_session, race_laps, race_prediction_features,
+                      to_records)
 from app.models import tyre_ml
 from app.models.degradation import compound_model, stint_degradation
+from app.models.race_predictor import ensure_trained, predict_race
 from app.models.strategy import compare_actual, simulate
 
 app = FastAPI(title="F1 Intel", version="0.1.0")
@@ -133,6 +136,25 @@ def strategy(year: int, gp: str, max_stops: int = Query(2, ge=1, le=3), top: int
 def team(year: int, gp: str, session: str = "R"):
     laps = _race_laps(year, gp, session)
     return to_records(team_report(laps))
+
+
+@app.get("/predict/race/{year}/{gp}")
+def predict_race_route(year: int, gp: str, circuit_id: str | None = None):
+    if not RACE_DATASET_PATH.exists():
+        raise HTTPException(503, "Race dataset not built yet -- run scripts/build_race_dataset.py")
+    pos_pipe, pts_pipe = ensure_trained(RACE_DATASET_PATH)
+    try:
+        features = race_prediction_features(year, gp, circuit_id)
+    except DataError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- e.g. gp/year not found by any source
+        raise HTTPException(404, f"Could not load qualifying for {year} {gp}: {e}") from e
+
+    preds = predict_race(pos_pipe, pts_pipe, features)
+    predicted_order = preds.sort_values("predicted_position")[
+        ["driver", "team_id", "predicted_position", "points_probability"]]
+    grid_order = preds.sort_values("grid")[["driver", "team_id", "grid"]]
+    return {"predicted_order": to_records(predicted_order), "grid_order": to_records(grid_order)}
 
 
 class TyreQuery(BaseModel):

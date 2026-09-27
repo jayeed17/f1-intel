@@ -18,11 +18,14 @@ from app.analysis.braking import assign_corners, braking_zones, compare_corners 
 from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
+from app.config import RACE_DATASET_PATH  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
                       get_lap, get_session, has_position_data, lap_telemetry,
                       load_session, prebuilt_built_at, prebuilt_races, race_laps,
-                      session_missing)
+                      race_prediction_features, session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
+from app.models.race_predictor import FEATURES, TARGET_POS, _prep  # noqa: E402
+from app.models.race_predictor import ensure_trained, evaluate, predict_race  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
@@ -32,6 +35,7 @@ COMPOUND_COLORS = {"SOFT": "#E8002D", "MEDIUM": "#FFD12E", "HARD": "#F0F0EC"}
 # These three need per-lap car telemetry (heavy); the rest only need lap timing.
 TELEMETRY_VIEWS = ["Braking", "Head to head", "Track dominance"]
 PARQUET_VIEWS = ["Tyre degradation", "Strategy", "Team report"]
+PREDICTOR_VIEWS = ["Race predictor"]
 _SESSION_ORDER = ["FP1", "FP2", "FP3", "SQ", "S", "Q", "R"]
 
 
@@ -53,6 +57,27 @@ def cached_race_laps(year: int, gp: str) -> pd.DataFrame:
     return race_laps(year, gp)
 
 
+@st.cache_resource(show_spinner="Training race predictor...")
+def cached_predictor_models():
+    return ensure_trained(RACE_DATASET_PATH)
+
+
+@st.cache_data(show_spinner="Evaluating race predictor (walk-forward CV)...")
+def cached_predictor_metrics() -> dict:
+    _, metrics = evaluate(pd.read_parquet(RACE_DATASET_PATH))
+    return metrics
+
+
+@st.cache_data(show_spinner="Computing feature importance...")
+def cached_feature_importance(_pos_pipe) -> pd.DataFrame:
+    from sklearn.inspection import permutation_importance
+    df = pd.read_parquet(RACE_DATASET_PATH).dropna(subset=[TARGET_POS])
+    X, y = _prep(df), df[TARGET_POS]
+    r = permutation_importance(_pos_pipe, X, y, n_repeats=5, random_state=42,
+                               scoring="neg_mean_absolute_error")
+    return pd.DataFrame({"feature": FEATURES, "importance": r.importances_mean}).sort_values("importance")
+
+
 def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
     """Race dropdown labels, newest first, straight from the prebuilt manifest."""
     races = prebuilt_races()
@@ -69,9 +94,12 @@ with st.sidebar:
     race_label = st.selectbox("Race", race_labels, index=0)
     year, gp = race_map[race_label]
 
-    view = st.radio("View", TELEMETRY_VIEWS + PARQUET_VIEWS)
+    view = st.radio("View", TELEMETRY_VIEWS + PARQUET_VIEWS + PREDICTOR_VIEWS)
     if view in TELEMETRY_VIEWS:
         kind = st.selectbox("Session", _SESSION_ORDER, index=_SESSION_ORDER.index("Q"))
+    elif view in PREDICTOR_VIEWS:
+        kind = "Q"
+        st.caption("Predicts from this race's Qualifying results.")
     else:
         kind = "R"
         st.caption("Uses Race session data.")
@@ -221,6 +249,41 @@ def render_view() -> None:
         long = rep.melt(id_vars="Team", value_vars=gap_cols, var_name="sector", value_name="gap_s")
         fig = px.bar(long, x="Team", y="gap_s", color="sector", barmode="group", template=TEMPLATE)
         fig.update_layout(height=420, yaxis_title="gap to best sector (s)")
+        st.plotly_chart(fig, width="stretch")
+
+    elif view == "Race predictor":
+        if not RACE_DATASET_PATH.exists():
+            st.warning("Race dataset not built yet -- run `python -m scripts.build_race_dataset`.")
+            return
+        pos_pipe, pts_pipe = cached_predictor_models()
+        try:
+            features = race_prediction_features(int(year), gp)
+        except Exception as e:
+            st.error(f"Could not load qualifying for this race: {e}")
+            return
+
+        preds = predict_race(pos_pipe, pts_pipe, features)
+        st.caption("Predicted from this race's qualifying results, as if predicting before the race "
+                  "(grid assumed = qualifying classification). Model does not currently beat the "
+                  "grid/quali baselines -- see the track record below.")
+        show = preds[["predicted_position", "driver", "team_id", "grid", "points_probability"]].rename(
+            columns={"predicted_position": "Predicted", "driver": "Driver", "team_id": "Team",
+                    "grid": "Grid (quali)", "points_probability": "P(points)"})
+        st.dataframe(show, width="stretch", hide_index=True)
+
+        st.subheader("Feature importance (permutation, full dataset)")
+        imp = cached_feature_importance(pos_pipe)
+        fig = px.bar(imp, x="importance", y="feature", orientation="h", template=TEMPLATE)
+        fig.update_layout(height=400, xaxis_title="importance (MAE increase when shuffled)", yaxis_title="")
+        st.plotly_chart(fig, width="stretch")
+
+        st.subheader("Season track record: model vs grid baseline")
+        metrics = cached_predictor_metrics()
+        rows = [{"season": season, "method": method, "position_mae": m[method]["position_mae"]}
+               for season, m in metrics.get("by_season", {}).items() for method in ("model", "baseline_grid")]
+        record = pd.DataFrame(rows)
+        fig = px.bar(record, x="season", y="position_mae", color="method", barmode="group", template=TEMPLATE)
+        fig.update_layout(height=400, yaxis_title="position MAE (lower is better)")
         st.plotly_chart(fig, width="stretch")
 
 
