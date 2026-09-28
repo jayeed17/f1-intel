@@ -20,11 +20,14 @@ DNF / DSQ / pit-lane start / grid penalty handling:
   reflect DSQ (demoted below every classified finisher) and retirees who
   covered enough of the race to be classified, since they ultimately trace
   back to the same FIA timing data.
-- "DNF" (for the rolling driver_dnf_rate_10 feature only -- not a target) is
-  derived uniformly from lap count: completed < 90% of the race's max lap
-  count that race. This is a proxy for the official classification
-  threshold, not the official ruling, but it's source-agnostic and
-  consistent across 2022-2026.
+- "DNF" (for the rolling driver_dnf_rate_10/team_dnf_rate_10 features, AND as
+  the race outcome predictor's DNF classifier target -- see
+  app/models/race_predictor.py) is derived uniformly from lap count:
+  completed < 90% of the race's max lap count that race. This is a proxy for
+  the official classification threshold, not the official ruling, but it's
+  source-agnostic and consistent across 2022-2026. target_delta (finish -
+  grid, the predictor's regression target) is only meaningful for dnf == 0
+  rows -- a retiree's "positions gained" isn't the quantity of interest.
 - Pit-lane starts report grid=0 in both sources. Replaced with
   (field_size + 1) -- numerically worse than every real grid slot -- plus a
   `grid_pit_lane` boolean flag column so the model can also learn it's not
@@ -86,9 +89,10 @@ FINAL_COLUMNS = [
     "season", "round", "event_name", "circuit_id", "driver", "team_id",
     "grid", "grid_pit_lane", "quali_position", "quali_gap_to_pole_s", "teammate_quali_gap_s",
     "driver_rolling_avg_finish_3", "driver_rolling_avg_finish_5",
-    "team_rolling_avg_finish_3", "team_rolling_pace_gap_3", "driver_dnf_rate_10",
+    "team_rolling_avg_finish_3", "team_rolling_pace_gap_3",
+    "driver_dnf_rate_10", "team_dnf_rate_10",
     "circuit_type", "reg_change_flag", "dnf", "source",
-    "target_finish_pos", "target_points_top10",
+    "target_finish_pos", "target_points_top10", "target_delta",
 ]
 
 
@@ -273,6 +277,24 @@ def _rolling(s: pd.Series, window: int) -> pd.Series:
     return s.shift(1).rolling(window, min_periods=1).mean()
 
 
+def add_delta_and_team_dnf_features(df: pd.DataFrame) -> pd.DataFrame:
+    """target_delta (positions gained: finish - grid, the race-outcome-predictor
+    rework's regression target for classified finishers) and team_dnf_rate_10
+    (team-level rolling DNF rate, the DNF classifier's team-level feature --
+    mirrors driver_dnf_rate_10 but rolled over the team's last 10 team-races).
+    Pulled out as its own function (not inlined in build_dataset) so the same
+    logic can be applied to an already-built dataset.parquet without a full
+    network rebuild -- see scripts/patch_race_dataset.py."""
+    df = df.copy()
+    df["target_delta"] = df["target_finish_pos"] - df["grid"]
+    team_race = df.groupby(["season", "round", "team_id"], as_index=False).agg(team_dnf=("dnf", "mean"))
+    team_race = team_race.sort_values(["team_id", "season", "round"])
+    team_race["team_dnf_rate_10"] = team_race.groupby("team_id")["team_dnf"].transform(
+        lambda s: _rolling(s, 10))
+    return df.merge(team_race[["season", "round", "team_id", "team_dnf_rate_10"]],
+                    on=["season", "round", "team_id"], how="left")
+
+
 def collect_all(seasons_prebuilt: tuple[int, ...] = (2025, 2026),
                 seasons_ergast: tuple[int, ...] = (2022, 2023, 2024)) -> pd.DataFrame:
     crosswalk = _circuit_crosswalk(list(seasons_prebuilt) + list(seasons_ergast))
@@ -352,6 +374,8 @@ def build_dataset(seasons_prebuilt: tuple[int, ...] = (2025, 2026),
     df = df.dropna(subset=["target_finish_pos"]).reset_index(drop=True)
     if before != len(df):
         print(f"! dropped {before - len(df)} rows with no classified finish position (DNS with no data)")
+
+    df = add_delta_and_team_dnf_features(df)
 
     return df.sort_values(["season", "round", "target_finish_pos"])[FINAL_COLUMNS].reset_index(drop=True)
 
