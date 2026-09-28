@@ -29,7 +29,7 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 | Strategy simulator | Brute-force 1–3 stop plans vs what each driver actually ran, seconds lost vs optimal |
 | Team report | Sector gaps, speed-trap deficit, race pace, pit lane time, auto "where to improve" notes |
 | Tyre ML model | Gradient-boosted model predicting lap-time loss from tyre age, compound, fuel, temps, circuit, validated leave-circuit-out |
-| Race predictor | Predicts finish order + points probability from qualifying (grid, rolling form, team pace, circuit type); walk-forward CV'd against grid/quali baselines — [track record and honest results below](#race-outcome-predictor) |
+| Race predictor | Positions-gained + DNF models combined via Monte Carlo simulation into P(win)/P(podium)/P(points) per driver; dev/holdout CV'd against grid/quali baselines — [track record and honest results below](#race-outcome-predictor) |
 
 ## Quickstart
 
@@ -76,11 +76,37 @@ Streamlit Cloud can't reach F1's live timing feed at all, so the dashboard is ba
 
 ## Race outcome predictor
 
-`HistGradientBoosting` position regressor + points classifier, trained on one row per driver per race (2022–2026, `data/model/race_dataset.parquet`, built by `scripts/build_race_dataset.py`) — grid, qualifying gap to pole, rolling driver/team form, team pace gap, DNF rate, circuit type. Evaluated with expanding-window time-based CV (never trains on a future race) against two baselines: **finish = grid** and **finish = qualifying position**.
+Two small `HistGradientBoosting` models, not one direct finish-position regressor (an earlier version of this that predicted finish position directly lost to the grid baseline on every metric — see git history):
 
-**Honest result: the model does not currently beat either baseline.** Grid position alone is a very strong predictor of finish position in F1, and a model trained on ~2,100 rows doesn't have enough signal to beat it yet — see `app/models/race_predictor.py`'s module docstring and the dashboard's "Season track record" chart for the actual per-season numbers. It's still useful as a probability-of-points estimate and a live track record (`predictions/{year}.csv`, scored weekly), just not (yet) as a better position predictor than "grid stays put."
+- **Positions-gained regressor**: predicts `finish − grid` for classified finishers only. Grid position alone already explains most of the variance in an F1 result, so the model only has to learn the (much smaller, much easier) correction on top of it — and heavy regularization (`max_leaf_nodes=7`, `min_samples_leaf=30`, early stopping) lets it shrink toward "no change" when there's genuinely nothing to add.
+- **DNF classifier**: predicts P(DNF) from a small feature set (driver/team rolling DNF rate, grid, circuit type, reg-change flag).
+- **Monte Carlo simulation** (10,000 runs per race): each run samples a DNF per driver from P(DNF) (classified at a position resampled from the historical distribution of where retirees actually finished) and, for finishers, `grid + predicted delta + noise` (noise ~ walk-forward CV residual std). Ranking every run's raw positions and averaging gives P(win)/P(podium)/P(points) per driver, plus an expected position for the predicted running order.
 
-Weekly predictions are logged automatically: `scripts/predict_next_race.py` runs after qualifying (Saturday 20:00 UTC) and appends to `predictions/{year}.csv`; `scripts/score_predictions.py` runs after the race (Monday) and fills in actual results. Both fail loudly (non-zero exit) if expected data is missing rather than silently doing nothing.
+Trained on one row per driver per race (2022–2026, `data/model/race_dataset.parquet`, built by `scripts/build_race_dataset.py`) — grid, qualifying gap to pole, rolling driver/team form, team pace gap, DNF rate, circuit type.
+
+**Evaluation protocol**: every design decision (features, model architecture, hyperparameters) was chosen using expanding-window walk-forward CV on 2022–2024 ("dev") only — `select_hyperparams()`/`select_dnf_hyperparams()` raise immediately if ever handed a 2025+ row, so this is enforced in code, not just convention (`tests/test_race_predictor.py::test_select_hyperparams_refuses_holdout_rows`). 2025–2026 ("holdout") was then evaluated exactly once and is reported below as-is.
+
+**Holdout result (2025–2026, 38 races, 787 driver-rows)**, model vs **finish = grid** vs **finish = qualifying position**:
+
+| metric | model | grid | quali |
+|---|---|---|---|
+| position MAE (↓) | **3.33** | 3.37 | 3.32 |
+| Spearman (↑) | 0.66 | 0.65 | 0.66 |
+| top-3 hit rate | 0.82 | 0.82 | 0.82 |
+| winner accuracy | 0.53 | **0.66** | **0.66** |
+| points F1 | 0.77 | 0.77 | **0.78** |
+
+Probabilistic (Brier / log loss, lower is better) vs a baseline that turns grid position into a probability (empirical P(outcome \| grid slot) from 2022–2024 only):
+
+| outcome | model Brier | baseline Brier | model log loss | baseline log loss |
+|---|---|---|---|---|
+| win | 0.0318 | **0.0261** | 0.105 | **0.101** |
+| podium | 0.0659 | **0.0610** | 0.216 | **0.203** |
+| points | **0.1615** | 0.1626 | **0.496** | 0.500 |
+
+**Honest result: still doesn't clearly win.** The rework closed most of the gap from the old model (which lost on every metric) — it now edges ahead of the grid baseline on position MAE and both points-probability metrics — but the simple grid/qualifying baselines are still noticeably better at picking the actual race winner (0.66 vs 0.53 accuracy) and at calibrated win/podium probabilities. **Closest**: points classification (MAE, F1, Brier, log loss all within a hair of the baselines, points Brier/log loss actually best-in-class). **Furthest behind**: winner accuracy and win/podium probability calibration — predicting *who wins*, as opposed to *who scores*, is where grid position's signal is hardest to improve on with ~2,100 training rows. See `app/models/race_predictor.py`'s module docstring, the dashboard's "Race predictor" view (calibration chart + season track record), or `models/race_predictor_metrics.json` (regenerated by `scripts.train`-style calls, gitignored) for the full dev+holdout+per-season breakdown.
+
+Weekly predictions are logged automatically: `scripts/predict_next_race.py` runs after qualifying (Saturday 20:00 UTC) and appends predicted position + P(win)/P(podium)/P(points) per driver to `predictions/{year}.csv`; `scripts/score_predictions.py` runs after the race (Monday) and fills in actual results. Both fail loudly (non-zero exit) if expected data is missing rather than silently doing nothing.
 
 ## Method notes and limits
 
