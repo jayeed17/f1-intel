@@ -743,21 +743,24 @@ def _quali_features_for_prediction(s) -> pd.DataFrame:
 
 def _rolling_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, team_id: str) -> dict:
     """Best-effort 'form entering the next race'. driver_* and
-    team_rolling_avg_finish_3 are recomputed fresh from actual past results
-    (target_finish_pos is saved in the dataset, so this correctly includes
-    each driver/team's most recent race). team_rolling_pace_gap_3 reuses the
-    driver's own most recent pre-race value as-is -- one race stale, since
-    the raw per-race pace gap isn't persisted, only the already-rolled
-    column -- a minor approximation for an inherently approximate exercise.
+    team_rolling_avg_finish_3/team_dnf_rate_10 are recomputed fresh from
+    actual past results (target_finish_pos/dnf are saved in the dataset, so
+    this correctly includes each driver/team's most recent race).
+    team_rolling_pace_gap_3 reuses the driver's own most recent pre-race
+    value as-is -- one race stale, since the raw per-race pace gap isn't
+    persisted, only the already-rolled column -- a minor approximation for
+    an inherently approximate exercise.
     """
     dh = dataset[dataset["driver"] == driver].sort_values(["season", "round"])
-    th = dataset[dataset["team_id"] == team_id].groupby(["season", "round"])["target_finish_pos"].mean()
+    th = dataset[dataset["team_id"] == team_id].groupby(["season", "round"]).agg(
+        finish=("target_finish_pos", "mean"), dnf=("dnf", "mean")).sort_index()
     return {
         "driver_rolling_avg_finish_3": dh["target_finish_pos"].tail(3).mean() if not dh.empty else np.nan,
         "driver_rolling_avg_finish_5": dh["target_finish_pos"].tail(5).mean() if not dh.empty else np.nan,
         "driver_dnf_rate_10": dh["dnf"].tail(10).mean() if not dh.empty else np.nan,
-        "team_rolling_avg_finish_3": th.tail(3).mean() if not th.empty else np.nan,
+        "team_rolling_avg_finish_3": th["finish"].tail(3).mean() if not th.empty else np.nan,
         "team_rolling_pace_gap_3": dh["team_rolling_pace_gap_3"].iloc[-1] if not dh.empty else np.nan,
+        "team_dnf_rate_10": th["dnf"].tail(10).mean() if not th.empty else np.nan,
     }
 
 

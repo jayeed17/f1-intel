@@ -24,8 +24,10 @@ from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa:
                       load_session, prebuilt_built_at, prebuilt_races, race_laps,
                       race_prediction_features, session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
-from app.models.race_predictor import FEATURES, TARGET_POS, _prep  # noqa: E402
-from app.models.race_predictor import ensure_trained, evaluate, predict_race  # noqa: E402
+from app.models.race_predictor import DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS  # noqa: E402
+from app.models.race_predictor import FEATURES_DELTA, FEATURES_DNF, TARGET_DELTA, TARGET_DNF  # noqa: E402
+from app.models.race_predictor import _prep_delta, _prep_dnf  # noqa: E402
+from app.models.race_predictor import ensure_trained, predict_race, run_full_evaluation  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
@@ -62,20 +64,26 @@ def cached_predictor_models():
     return ensure_trained(RACE_DATASET_PATH)
 
 
-@st.cache_data(show_spinner="Evaluating race predictor (walk-forward CV)...")
-def cached_predictor_metrics() -> dict:
-    _, metrics = evaluate(pd.read_parquet(RACE_DATASET_PATH))
-    return metrics
+@st.cache_data(show_spinner="Evaluating race predictor (walk-forward CV + Monte Carlo)...")
+def cached_predictor_report() -> dict:
+    return run_full_evaluation(pd.read_parquet(RACE_DATASET_PATH), DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS)
 
 
 @st.cache_data(show_spinner="Computing feature importance...")
-def cached_feature_importance(_pos_pipe) -> pd.DataFrame:
+def cached_feature_importance(_delta_pipe, _dnf_pipe) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sklearn.inspection import permutation_importance
-    df = pd.read_parquet(RACE_DATASET_PATH).dropna(subset=[TARGET_POS])
-    X, y = _prep(df), df[TARGET_POS]
-    r = permutation_importance(_pos_pipe, X, y, n_repeats=5, random_state=42,
-                               scoring="neg_mean_absolute_error")
-    return pd.DataFrame({"feature": FEATURES, "importance": r.importances_mean}).sort_values("importance")
+    df = pd.read_parquet(RACE_DATASET_PATH)
+    delta_df = df[df[TARGET_DNF] == 0].dropna(subset=[TARGET_DELTA])
+    r_delta = permutation_importance(_delta_pipe, _prep_delta(delta_df), delta_df[TARGET_DELTA],
+                                     n_repeats=5, random_state=42, scoring="neg_mean_absolute_error")
+    dnf_df = df.dropna(subset=[TARGET_DNF])
+    r_dnf = permutation_importance(_dnf_pipe, _prep_dnf(dnf_df), dnf_df[TARGET_DNF],
+                                   n_repeats=5, random_state=42, scoring="neg_log_loss")
+    imp_delta = pd.DataFrame({"feature": FEATURES_DELTA, "importance": r_delta.importances_mean}
+                            ).sort_values("importance")
+    imp_dnf = pd.DataFrame({"feature": FEATURES_DNF, "importance": r_dnf.importances_mean}
+                          ).sort_values("importance")
+    return imp_delta, imp_dnf
 
 
 def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
@@ -255,36 +263,75 @@ def render_view() -> None:
         if not RACE_DATASET_PATH.exists():
             st.warning("Race dataset not built yet -- run `python -m scripts.build_race_dataset`.")
             return
-        pos_pipe, pts_pipe = cached_predictor_models()
+        delta_pipe, dnf_pipe, meta = cached_predictor_models()
         try:
             features = race_prediction_features(int(year), gp)
         except Exception as e:
             st.error(f"Could not load qualifying for this race: {e}")
             return
 
-        preds = predict_race(pos_pipe, pts_pipe, features)
+        preds = predict_race(delta_pipe, dnf_pipe, features, meta)
         st.caption("Predicted from this race's qualifying results, as if predicting before the race "
-                  "(grid assumed = qualifying classification). Model does not currently beat the "
-                  "grid/quali baselines -- see the track record below.")
-        show = preds[["predicted_position", "driver", "team_id", "grid", "points_probability"]].rename(
-            columns={"predicted_position": "Predicted", "driver": "Driver", "team_id": "Team",
-                    "grid": "Grid (quali)", "points_probability": "P(points)"})
-        st.dataframe(show, width="stretch", hide_index=True)
+                  "(grid assumed = qualifying classification). Positions-gained model + DNF model, "
+                  "combined via a 10k-run Monte Carlo simulation -- see the holdout track record "
+                  "below for how this actually compares to the grid/quali baselines on 2025-2026.")
+        show = preds[["predicted_position", "driver", "team_id", "grid",
+                     "win_probability", "podium_probability", "points_probability"]].copy()
+        for c in ("win_probability", "podium_probability", "points_probability"):
+            show[c] = show[c] * 100
+        show = show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
+                                    "team_id": "Team", "grid": "Grid (quali)",
+                                    "win_probability": "P(win)", "podium_probability": "P(podium)",
+                                    "points_probability": "P(points)"})
+        st.dataframe(show, width="stretch", hide_index=True,
+                    column_config={c: st.column_config.NumberColumn(format="%.1f%%")
+                                  for c in ("P(win)", "P(podium)", "P(points)")})
 
         st.subheader("Feature importance (permutation, full dataset)")
-        imp = cached_feature_importance(pos_pipe)
-        fig = px.bar(imp, x="importance", y="feature", orientation="h", template=TEMPLATE)
-        fig.update_layout(height=400, xaxis_title="importance (MAE increase when shuffled)", yaxis_title="")
+        imp_delta, imp_dnf = cached_feature_importance(delta_pipe, dnf_pipe)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("Positions-gained (delta) model -- MAE increase when shuffled")
+            fig = px.bar(imp_delta, x="importance", y="feature", orientation="h", template=TEMPLATE)
+            fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
+            st.plotly_chart(fig, width="stretch")
+        with col2:
+            st.caption("DNF model -- log-loss increase when shuffled")
+            fig = px.bar(imp_dnf, x="importance", y="feature", orientation="h", template=TEMPLATE)
+            fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
+            st.plotly_chart(fig, width="stretch")
+
+        report = cached_predictor_report()
+
+        st.subheader("Season track record: model vs grid baseline (position MAE)")
+        rows = [{"season": season, "method": method,
+                "position_mae": m.get("point_metrics", {}).get(method, {}).get("position_mae")}
+               for season, m in report.get("by_season", {}).items() for method in ("model", "baseline_grid")]
+        record = pd.DataFrame(rows).dropna(subset=["position_mae"])
+        fig = px.bar(record, x="season", y="position_mae", color="method", barmode="group", template=TEMPLATE)
+        fig.update_layout(height=380, yaxis_title="position MAE (lower is better)")
         st.plotly_chart(fig, width="stretch")
 
-        st.subheader("Season track record: model vs grid baseline")
-        metrics = cached_predictor_metrics()
-        rows = [{"season": season, "method": method, "position_mae": m[method]["position_mae"]}
-               for season, m in metrics.get("by_season", {}).items() for method in ("model", "baseline_grid")]
-        record = pd.DataFrame(rows)
-        fig = px.bar(record, x="season", y="position_mae", color="method", barmode="group", template=TEMPLATE)
-        fig.update_layout(height=400, yaxis_title="position MAE (lower is better)")
-        st.plotly_chart(fig, width="stretch")
+        st.subheader("Holdout (2025-2026) calibration: predicted P(points) vs observed frequency")
+        cal = report.get("holdout", {}).get("calibration", {}).get("points")
+        if cal:
+            cal_df = pd.DataFrame(cal)
+            fig = px.line(cal_df, x="predicted", y="observed", markers=True, template=TEMPLATE)
+            fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1,
+                         line=dict(dash="dash", color="gray"))
+            fig.update_layout(height=380, xaxis_title="predicted P(points)",
+                             yaxis_title="observed frequency", xaxis_range=[0, 1], yaxis_range=[0, 1])
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.caption("Not enough holdout rows yet for a calibration curve.")
+
+        holdout_model = report.get("holdout", {}).get("point_metrics", {}).get("model", {})
+        holdout_grid = report.get("holdout", {}).get("point_metrics", {}).get("baseline_grid", {})
+        if holdout_model and holdout_grid:
+            st.caption(f"Holdout (2025-2026, {report['holdout']['n_races']} races): model position MAE "
+                      f"{holdout_model['position_mae']} vs grid baseline {holdout_grid['position_mae']} -- "
+                      "see the README's \"Race outcome predictor\" section for the full honest comparison "
+                      "(point + probabilistic metrics) against both baselines.")
 
 
 try:

@@ -83,14 +83,15 @@ def main() -> None:
 
     if not RACE_DATASET_PATH.exists():
         raise SystemExit(f"No dataset at {RACE_DATASET_PATH} -- run scripts/build_race_dataset.py first.")
-    pos_pipe, pts_pipe = ensure_trained(RACE_DATASET_PATH)
+    delta_pipe, dnf_pipe, meta = ensure_trained(RACE_DATASET_PATH)
 
     features = race_prediction_features(year, gp, circuit_id)
-    preds = predict_race(pos_pipe, pts_pipe, features)
+    preds = predict_race(delta_pipe, dnf_pipe, features, meta)
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     path = PREDICTIONS_DIR / f"{year}.csv"
-    out = preds[["driver", "team_id", "grid", "predicted_position", "points_probability"]].copy()
+    out = preds[["driver", "team_id", "grid", "predicted_position",
+                "win_probability", "podium_probability", "points_probability"]].copy()
     out.insert(0, "predicted_at", pd.Timestamp.now(tz="UTC").isoformat())
     out.insert(1, "gp", gp)
     out["actual_position"] = pd.NA

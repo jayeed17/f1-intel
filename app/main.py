@@ -142,7 +142,7 @@ def team(year: int, gp: str, session: str = "R"):
 def predict_race_route(year: int, gp: str, circuit_id: str | None = None):
     if not RACE_DATASET_PATH.exists():
         raise HTTPException(503, "Race dataset not built yet -- run scripts/build_race_dataset.py")
-    pos_pipe, pts_pipe = ensure_trained(RACE_DATASET_PATH)
+    delta_pipe, dnf_pipe, meta = ensure_trained(RACE_DATASET_PATH)
     try:
         features = race_prediction_features(year, gp, circuit_id)
     except DataError:
@@ -150,9 +150,10 @@ def predict_race_route(year: int, gp: str, circuit_id: str | None = None):
     except Exception as e:  # noqa: BLE001 -- e.g. gp/year not found by any source
         raise HTTPException(404, f"Could not load qualifying for {year} {gp}: {e}") from e
 
-    preds = predict_race(pos_pipe, pts_pipe, features)
+    preds = predict_race(delta_pipe, dnf_pipe, features, meta)
     predicted_order = preds.sort_values("predicted_position")[
-        ["driver", "team_id", "predicted_position", "points_probability"]]
+        ["driver", "team_id", "predicted_position", "win_probability",
+        "podium_probability", "points_probability"]]
     grid_order = preds.sort_values("grid")[["driver", "team_id", "grid"]]
     return {"predicted_order": to_records(predicted_order), "grid_order": to_records(grid_order)}
 
