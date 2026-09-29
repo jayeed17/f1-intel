@@ -477,7 +477,77 @@ def run_full_evaluation(df: pd.DataFrame, delta_params: dict | None = None, dnf_
         "holdout": summarise(holdout_preds, grid_prob_table),
         "by_season": {str(season): summarise(g, grid_prob_table) for season, g in preds.groupby("season")},
     }
+    if not holdout_preds.empty:
+        report["holdout"]["bootstrap_ci"] = bootstrap_diff_ci(holdout_preds, grid_prob_table)
     return report
+
+
+# --------------------------------------------------------------------------
+# Bootstrap CIs for model-minus-baseline differences (resample races, not
+# rows -- a race is the unit of "how would a different sample of races have
+# looked", so this is a cluster/block bootstrap).
+# --------------------------------------------------------------------------
+
+def _per_race_bootstrap_data(preds: pd.DataFrame, grid_prob_table: pd.DataFrame) -> list[dict]:
+    races = []
+    for _, race in preds.groupby(GROUP_COLS, sort=False):
+        bp = baseline_grid_probs(race["grid"], grid_prob_table)
+        races.append({
+            "model_mae": mean_absolute_error(race[TARGET_POS], race["model_pos"]),
+            "grid_mae": mean_absolute_error(race[TARGET_POS], race["baseline_grid_pos"]),
+            "actual_points": (race[TARGET_POS] <= 10).to_numpy(dtype=float),
+            "actual_win": (race[TARGET_POS] == 1).to_numpy(dtype=float),
+            "model_p_points": race["p_points"].to_numpy(),
+            "base_p_points": bp["p_points"].to_numpy(),
+            "model_p_win": race["p_win"].to_numpy(),
+            "base_p_win": bp["p_win"].to_numpy(),
+        })
+    return races
+
+
+def bootstrap_diff_ci(preds: pd.DataFrame, grid_prob_table: pd.DataFrame, n_boot: int = 2000,
+                      ci: float = 0.95, seed: int = 42) -> dict:
+    """Percentile bootstrap CI, resampling whole races with replacement, for
+    model-minus-baseline differences on position MAE (vs finish=grid),
+    points Brier (vs the empirical grid-probability baseline), and win
+    Brier (same baseline). Negative mean_diff = model better (lower
+    error/Brier) than the baseline; the CI says how strongly the holdout
+    data actually supports that, rather than just the point estimate."""
+    race_data = _per_race_bootstrap_data(preds, grid_prob_table)
+    n = len(race_data)
+    rng = np.random.default_rng(seed)
+    mae_diff = np.empty(n_boot)
+    points_brier_diff = np.empty(n_boot)
+    win_brier_diff = np.empty(n_boot)
+
+    for b in range(n_boot):
+        sample = [race_data[i] for i in rng.integers(0, n, size=n)]
+        mae_diff[b] = (np.mean([r["model_mae"] for r in sample])
+                      - np.mean([r["grid_mae"] for r in sample]))
+
+        actual_points = np.concatenate([r["actual_points"] for r in sample])
+        model_p_points = np.clip(np.concatenate([r["model_p_points"] for r in sample]), 1e-6, 1 - 1e-6)
+        base_p_points = np.clip(np.concatenate([r["base_p_points"] for r in sample]), 1e-6, 1 - 1e-6)
+        points_brier_diff[b] = (brier_score_loss(actual_points, model_p_points)
+                                - brier_score_loss(actual_points, base_p_points))
+
+        actual_win = np.concatenate([r["actual_win"] for r in sample])
+        model_p_win = np.clip(np.concatenate([r["model_p_win"] for r in sample]), 1e-6, 1 - 1e-6)
+        base_p_win = np.clip(np.concatenate([r["base_p_win"] for r in sample]), 1e-6, 1 - 1e-6)
+        win_brier_diff[b] = (brier_score_loss(actual_win, model_p_win)
+                             - brier_score_loss(actual_win, base_p_win))
+
+    alpha = (1 - ci) / 2
+
+    def _summarise(arr: np.ndarray) -> dict:
+        return {"mean_diff": round(float(arr.mean()), 4),
+               "ci_low": round(float(np.percentile(arr, 100 * alpha)), 4),
+               "ci_high": round(float(np.percentile(arr, 100 * (1 - alpha))), 4)}
+
+    return {"n_boot": n_boot, "ci": ci,
+           "position_mae_diff": _summarise(mae_diff),
+           "points_brier_diff": _summarise(points_brier_diff),
+           "win_brier_diff": _summarise(win_brier_diff)}
 
 
 # --------------------------------------------------------------------------

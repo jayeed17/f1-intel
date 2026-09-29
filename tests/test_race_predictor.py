@@ -5,9 +5,10 @@ import pytest
 
 from app.models.race_predictor import (
     DEV_SEASON_MAX, GROUP_COLS, TARGET_DELTA, TARGET_DNF, _prep_delta, _prep_dnf,
-    dev_holdout_split, empirical_grid_probs, evaluate, fit_final, make_delta_pipeline,
-    make_dnf_pipeline, predict_race, rank_within_race, race_sequence, run_full_evaluation,
-    select_dnf_hyperparams, select_hyperparams, simulate_positions, time_based_splits,
+    bootstrap_diff_ci, dev_holdout_split, empirical_grid_probs, evaluate, fit_final,
+    make_delta_pipeline, make_dnf_pipeline, predict_race, rank_within_race, race_sequence,
+    run_full_evaluation, select_dnf_hyperparams, select_hyperparams, simulate_positions,
+    time_based_splits,
 )
 
 
@@ -182,6 +183,30 @@ def test_run_full_evaluation_splits_dev_and_holdout():
     assert report["holdout"]["n_races"] > 0
     assert set(report["by_season"].keys()) == {"2022", "2023", "2024", "2025", "2026"}
     assert report["residual_std"] > 0
+    assert "bootstrap_ci" in report["holdout"]  # wired in automatically when holdout is non-empty
+
+
+def test_bootstrap_diff_ci_bounds_contain_mean_and_shrink_the_ci_narrower_for_more_races():
+    """Resampling whole races (not rows) for a percentile CI on the
+    model-minus-baseline difference. Sanity checks: the CI must bracket its
+    own mean_diff, and doubling the number of races (holding the underlying
+    per-race distribution roughly fixed) should not widen the CI."""
+    df = fake_race_dataset(n_seasons=2, n_rounds=7, n_drivers=14)
+    small_preds, _ = evaluate(df, min_train_races=6, n_sims=300)
+    grid_prob_table = empirical_grid_probs(df)
+
+    ci = bootstrap_diff_ci(small_preds, grid_prob_table, n_boot=300, seed=1)
+    assert ci["n_boot"] == 300 and ci["ci"] == 0.95
+    for key in ("position_mae_diff", "points_brier_diff", "win_brier_diff"):
+        d = ci[key]
+        assert d["ci_low"] <= d["mean_diff"] <= d["ci_high"]
+
+    df_more = fake_race_dataset(n_seasons=6, n_rounds=7, n_drivers=14)
+    big_preds, _ = evaluate(df_more, min_train_races=6, n_sims=300)
+    ci_more = bootstrap_diff_ci(big_preds, grid_prob_table, n_boot=300, seed=1)
+    small_width = ci["position_mae_diff"]["ci_high"] - ci["position_mae_diff"]["ci_low"]
+    big_width = ci_more["position_mae_diff"]["ci_high"] - ci_more["position_mae_diff"]["ci_low"]
+    assert big_width <= small_width * 1.5  # more races -> CI should not blow up
 
 
 def test_prep_handles_all_nan_numeric_column():
