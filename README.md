@@ -80,39 +80,47 @@ Two small `HistGradientBoosting` models, not one direct finish-position regresso
 
 - **Positions-gained regressor**: predicts `finish − grid` for classified finishers only. Grid position alone already explains most of the variance in an F1 result, so the model only has to learn the (much smaller, much easier) correction on top of it — and heavy regularization (`max_leaf_nodes=7`, `min_samples_leaf=30`, early stopping) lets it shrink toward "no change" when there's genuinely nothing to add.
 - **DNF classifier**: predicts P(DNF) from a small feature set (driver/team rolling DNF rate, grid, circuit type, reg-change flag).
-- **Monte Carlo simulation** (10,000 runs per race): each run samples a DNF per driver from P(DNF) (classified at a position resampled from the historical distribution of where retirees actually finished) and, for finishers, `grid + predicted delta + noise` (noise ~ walk-forward CV residual std). Ranking every run's raw positions and averaging gives P(win)/P(podium)/P(points) per driver, plus an expected position for the predicted running order.
+- **Monte Carlo simulation** (10,000 runs per race): each run samples a DNF per driver from P(DNF) (classified at a position resampled from the historical distribution of where retirees actually finished) and, for finishers, `grid + predicted delta + noise`. Noise std is **grid-bucket-dependent** (1–3 / 4–10 / 11+), not one global number — diagnosed on 2022–2024 CV: front-row residual std (~3.7) is meaningfully higher than mid-pack (~3.0), and using one global figure (~3.3) left P(win) under-confident for pole/front-row starters (predicted ~22%, actual ~28%) and over-confident for grid 4–10. **P(win)/P(podium) are then isotonic-calibrated** (fit on 2022–2024 CV predictions, applied unchanged everywhere else) — bucket noise alone only partly closed the gap; isotonic calibration on top closed the rest (dev win Brier 0.0342 → 0.0304 after both fixes). Ranking every simulated run's raw positions and averaging gives P(win)/P(podium)/P(points) per driver, plus an expected position for the predicted running order.
 
 Trained on one row per driver per race (2022–2026, `data/model/race_dataset.parquet`, built by `scripts/build_race_dataset.py`) — grid, qualifying gap to pole, rolling driver/team form, team pace gap, DNF rate, circuit type. Pit-lane starts (`GridPosition == 0` in the raw data) are remapped to the back of the grid (the actual number of cars that started that race) plus a `grid_pit_lane` flag feature — an earlier version of this remap used `max(everyone else's grid) + 1`, which could overshoot the real field size when grid numbers have gaps (confirmed on 2022 round 5: it produced `grid=21` in a 20-car race). Fixing it only touched 2 of 2146 rows and moved the holdout numbers by less than the width of their own confidence intervals below — see `tests/test_build_race_dataset.py`.
 
-**Evaluation protocol**: every design decision (features, model architecture, hyperparameters) was chosen using expanding-window walk-forward CV on 2022–2024 ("dev") only — `select_hyperparams()`/`select_dnf_hyperparams()` raise immediately if ever handed a 2025+ row, so this is enforced in code, not just convention (`tests/test_race_predictor.py::test_select_hyperparams_refuses_holdout_rows`). 2025–2026 ("holdout") was then evaluated exactly once and is reported below as-is.
+**Evaluation protocol**: every design decision (features, model architecture, hyperparameters, the grid-bucket noise scheme, the isotonic calibrators) was chosen/fit using expanding-window walk-forward CV on 2022–2024 ("dev") only — `select_hyperparams()`/`select_dnf_hyperparams()` raise immediately if ever handed a 2025+ row, so this is enforced in code, not just convention (`tests/test_race_predictor.py::test_select_hyperparams_refuses_holdout_rows`). 2025–2026 ("holdout") was then evaluated exactly once and is reported below as-is.
 
 **Holdout result (2025–2026, 38 races, 787 driver-rows)**, model vs **finish = grid** vs **finish = qualifying position**:
 
 | metric | model | grid | quali |
 |---|---|---|---|
-| position MAE (↓) | **3.33** | 3.37 | 3.32 |
-| Spearman (↑) | 0.66 | 0.65 | 0.66 |
-| top-3 hit rate | **0.84** | 0.82 | 0.82 |
-| winner accuracy | 0.53 | **0.66** | **0.66** |
+| position MAE (↓) | **3.30** | 3.37 | 3.32 |
+| Spearman (↑) | 0.66 | 0.65 | **0.66** |
+| top-3 hit rate | **0.87** | 0.82 | 0.82 |
+| winner accuracy | 0.55 | **0.66** | **0.66** |
 | points F1 | 0.77 | 0.77 | **0.78** |
 
 Probabilistic (Brier / log loss, lower is better) vs a baseline that turns grid position into a probability (empirical P(outcome \| grid slot) from 2022–2024 only):
 
 | outcome | model Brier | baseline Brier | model log loss | baseline log loss |
 |---|---|---|---|---|
-| win | 0.0317 | **0.0261** | 0.105 | **0.101** |
-| podium | 0.0661 | **0.0610** | 0.216 | **0.203** |
-| points | **0.1614** | 0.1626 | **0.496** | 0.500 |
+| win | 0.0283 | **0.0261** | 0.090 | **0.101** |
+| podium | 0.0633 | **0.0610** | **0.212** | 0.203 |
+| points | **0.1618** | 0.1626 | **0.497** | 0.500 |
 
-**How strong is that claim, really?** Bootstrap 95% CIs (2,000 resamples of whole holdout races, not rows — see `bootstrap_diff_ci()`) on model-minus-baseline:
+**How strong is that claim, really?** Bootstrap 95% CIs (2,000 resamples of whole holdout races, not rows — see `bootstrap_diff_ci()`) on model-minus-baseline, **after** the grid-bucket-noise + isotonic-calibration fix:
 
 | difference (model − baseline) | mean | 95% CI | significant? |
 |---|---|---|---|
-| position MAE vs grid | −0.041 | [−0.163, +0.067] | **no** — CI includes 0 |
-| points Brier vs grid-probability | −0.0012 | [−0.0077, +0.0053] | **no** — CI includes 0 |
-| win Brier vs grid-probability | **+0.0057** | **[+0.0016, +0.0095]** | **yes** — model is reliably worse |
+| position MAE vs grid | −0.066 | [−0.187, +0.044] | no — CI includes 0 |
+| points Brier vs grid-probability | −0.0008 | [−0.0073, +0.0054] | no — CI includes 0 |
+| win Brier vs grid-probability | +0.0023 | [−0.0012, +0.0059] | no — CI includes 0 |
 
-**Honest result: still doesn't clearly win, and now we know exactly how honest that "closer" claim is.** The apparent edges on position MAE and points Brier are not statistically distinguishable from noise at this sample size (38 races) — the CIs straddle zero, so don't read those as real wins. The one place the data *does* support a confident claim is the opposite direction: the model is reliably worse than the simple grid-probability baseline at calibrating win probability. **Closest**: points classification (F1 ties the grid baseline, Brier/log loss point estimates edge ahead, though not significantly). **Furthest behind, and the only difference with a CI that doesn't cross zero**: win probability calibration — with ~2,100 training rows, there just isn't enough signal to beat grid position at predicting *who wins*, only some evidence (not yet significant) of an edge at predicting *who scores*. See `app/models/race_predictor.py`'s module docstring, the dashboard's "Race predictor" view (calibration chart + season track record), or `models/race_predictor_metrics.json` (regenerated by `scripts.train`-style calls, gitignored) for the full dev+holdout+per-season breakdown.
+Before the fix, win Brier's CI was [+0.0016, +0.0095] — a statistically real deficit (the model was reliably *worse* than the baseline at win-probability calibration). After grid-bucket noise + isotonic calibration (both fit on 2022–2024 CV only), that CI now straddles zero: **the deficit is gone**, and none of the three differences are statistically distinguishable from noise at this sample size (38 races).
+
+**Honest result: still doesn't clearly win, but the one real weakness found in the previous round is fixed.** Point estimates lean the model's way on position MAE and top-3 hit rate, the baselines' way on winner accuracy and podium log loss — none of it is significant either direction. **Closest**: points classification, essentially indistinguishable from the baseline on every metric. **Furthest behind (though no longer *significantly* behind)**: still winner accuracy — with ~2,100 training rows, there isn't enough signal to reliably beat grid position at predicting *who wins*, only at approximately matching it. See `app/models/race_predictor.py`'s module docstring, the dashboard's "Race predictor" view (calibration chart + season track record), or `models/race_predictor_metrics.json` (regenerated by `scripts.train`-style calls, gitignored) for the full dev+holdout+per-season breakdown.
+
+**The model is now frozen** (v1.0.0, frozen 2026-09-28, `data/model/frozen/`) — no further tuning after this point. `scripts/predict_next_race.py` and everything else (`ensure_trained()`, so the API route and dashboard too) load this exact committed snapshot from here on, never a freshly self-trained copy, so the numbers above can't silently drift underneath a later code change. Re-freezing (`scripts/freeze_race_predictor.py`) is a deliberate, manual, rare action — bump the version and note why. Freeze with the same Python environment `requirements.txt` pins (a joblib file pickled by one scikit-learn version can fail to load in another — confirmed live going from local sklearn 1.4.2 to the pinned 1.9.1).
+
+### Live track record since 2026-09-28
+
+The clean, ongoing, genuinely prospective test: `predictions/{year}.csv` rows logged **at or after the freeze date**, scored against real results, completely untouched by any further tuning (unlike the CV/holdout numbers above, which did inform earlier design decisions). See the dashboard's "Race predictor" view for the live, always-current version of this section — as of this freeze, no race has been predicted since 2026-09-28 yet, so there's nothing to report here yet either. It fills in automatically as the weekly GitHub Action (Saturday predict, Monday score) runs going forward.
 
 Weekly predictions are logged automatically: `scripts/predict_next_race.py` runs after qualifying (Saturday 20:00 UTC) and appends predicted position + P(win)/P(podium)/P(points) per driver to `predictions/{year}.csv`; `scripts/score_predictions.py` runs after the race (Monday) and fills in actual results. Both fail loudly (non-zero exit) if expected data is missing rather than silently doing nothing.
 
@@ -137,12 +145,14 @@ scripts/train_tyre_model.py
 scripts/smoke_test.py   exercises every route's functions against a real session
 scripts/build_prebuilt.py   builds data/prebuilt/ (run locally or by the update-data Action)
 scripts/build_race_dataset.py   builds data/model/race_dataset.parquet (run locally, not by any Action)
-scripts/predict_next_race.py   logs a prediction row per driver to predictions/{year}.csv (Action: Saturday 20:00 UTC)
+scripts/freeze_race_predictor.py   trains + commits data/model/frozen/ (run locally, manually, rarely)
+scripts/predict_next_race.py   logs a prediction row per driver to predictions/{year}.csv (Action: Saturday 20:00 UTC) using ONLY the frozen model
 scripts/score_predictions.py   fills in actual results once a race is over (Action: Monday)
 tests/                 offline tests on synthetic data
 data/processed/{year}/{round}.parquet   Parquet cache for live-loaded races (gitignored)
 data/prebuilt/{year}/{round}/{session}/   committed prebuilt bundle: laps/results/corners/telemetry parquet + manifest.json
 data/model/race_dataset.parquet   committed race-predictor training set, one row per driver per race
+data/model/frozen/   committed frozen race-predictor snapshot (model.joblib + spec.json: version, frozen_at, hyperparams)
 predictions/{year}.csv   committed public track record of weekly predictions vs actual results
 .github/workflows/update-data.yml   rebuilds data/prebuilt/ twice a week; scores/predicts races on its own cron
 docs/img/              README screenshots
