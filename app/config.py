@@ -9,6 +9,10 @@ MODEL_DATA_DIR = ROOT / "data" / "model"
 RACE_DATASET_PATH = MODEL_DATA_DIR / "race_dataset.parquet"
 PREDICTIONS_DIR = ROOT / "predictions"
 
+# Committed (not gitignored, unlike MODEL_DIR) frozen race-predictor snapshot
+# -- see app/models/race_predictor.py's freeze_model()/load_frozen_model().
+FROZEN_MODEL_DIR = MODEL_DATA_DIR / "frozen"
+
 # Lap-time gain per lap from burning fuel (seconds). Rough public estimate; tune per track.
 FUEL_EFFECT_PER_LAP = 0.035
 

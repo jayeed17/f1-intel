@@ -32,7 +32,10 @@ Pure functions -- everything here takes/returns plain DataFrames, no FastF1.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import date
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -41,11 +44,12 @@ from scipy.stats import spearmanr
 from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, f1_score, log_loss, mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-from app.config import MODEL_DIR
+from app.config import FROZEN_MODEL_DIR, MODEL_DIR, PREDICTIONS_DIR
 
 # --------------------------------------------------------------------------
 # Feature sets. Two separate models -- the finisher delta regressor gets the
@@ -103,10 +107,15 @@ DNF_HP_GRID = [
     {"max_leaf_nodes": 15, "min_samples_leaf": 30, "learning_rate": 0.05, "max_iter": 500, "l2_regularization": 1.0},
 ]
 
-MODEL_DELTA_PATH = MODEL_DIR / "race_predictor_delta.joblib"
-MODEL_DNF_PATH = MODEL_DIR / "race_predictor_dnf.joblib"
-META_PATH = MODEL_DIR / "race_predictor_meta.json"
+# One joblib bundle {"delta_pipe":, "dnf_pipe":, "meta": {...}} rather than
+# separate delta/dnf/meta files -- meta can hold live sklearn objects
+# (IsotonicRegression calibrators), so it can't be plain JSON.
+MODEL_BUNDLE_PATH = MODEL_DIR / "race_predictor_bundle.joblib"
 METRICS_PATH = MODEL_DIR / "race_predictor_metrics.json"
+
+# Committed frozen snapshot (see freeze_model()/load_frozen_model() below).
+FROZEN_BUNDLE_PATH = FROZEN_MODEL_DIR / "model.joblib"
+FROZEN_SPEC_PATH = FROZEN_MODEL_DIR / "spec.json"
 
 
 def _prep(X: pd.DataFrame, num: list[str], bool_cols: list[str], cat: list[str]) -> pd.DataFrame:
@@ -212,30 +221,78 @@ def dev_holdout_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 # --------------------------------------------------------------------------
+# Grid-bucket-dependent Monte Carlo noise. Diagnosed on 2022-2024 dev-only
+# walk-forward CV: front-row finishes are reliably noisier than mid-pack
+# ones (residual std ~3.71 for grid 1-3 vs ~3.07 for grid 4-10, vs a global
+# ~3.27), and a single global residual_std understates that -- which showed
+# up as P(win) being under-confident for grid 1-3 (predicted ~0.225,
+# actual ~0.283) and over-confident for grid 4-10 (predicted ~0.043, actual
+# ~0.019). See README's "Race outcome predictor" section for the full
+# before/after comparison.
+# --------------------------------------------------------------------------
+
+GRID_BUCKET_BINS = [0, 3, 10, np.inf]
+GRID_BUCKET_LABELS = ["1-3", "4-10", "11+"]
+
+
+def grid_bucket(grid: pd.Series) -> pd.Series:
+    return pd.cut(grid, bins=GRID_BUCKET_BINS, labels=GRID_BUCKET_LABELS)
+
+
+def residual_std_by_grid_bucket(preds: pd.DataFrame, min_bucket_n: int = 10) -> dict[str, float]:
+    """Per-grid-bucket residual std (actual_delta - delta_pred) over
+    classified finishers in a walk-forward preds DataFrame. A bucket with
+    too few rows (< min_bucket_n) falls back to the overall std instead of
+    an unstable small-sample estimate."""
+    finishers = preds[preds[TARGET_DNF] == 0].copy()
+    resid = finishers[TARGET_POS] - finishers["grid"] - finishers["delta_pred"]
+    overall = float(resid.std()) if len(resid) > 1 else 1.0
+    finishers = finishers.assign(_resid=resid, _bucket=grid_bucket(finishers["grid"]))
+    out = {}
+    for label in GRID_BUCKET_LABELS:
+        g = finishers.loc[finishers["_bucket"] == label, "_resid"]
+        out[label] = float(g.std()) if len(g) >= min_bucket_n else overall
+    return out
+
+
+def grid_bucket_residual_std_array(grid: pd.Series, bucket_stds: dict[str, float],
+                                   fallback: float) -> np.ndarray:
+    """Map each driver's grid to their bucket's residual std, for
+    simulate_positions()'s per-driver residual_std array."""
+    buckets = grid_bucket(grid).astype(str)
+    return buckets.map(bucket_stds).fillna(fallback).to_numpy(dtype=float)
+
+
+# --------------------------------------------------------------------------
 # Monte Carlo race simulation
 # --------------------------------------------------------------------------
 
 def simulate_positions(grid: pd.Series, delta_pred: pd.Series, p_dnf: pd.Series,
-                       dnf_position_samples: np.ndarray, residual_std: float,
+                       dnf_position_samples: np.ndarray, residual_std: float | np.ndarray,
                        n_sims: int = 10_000, seed: int | None = None) -> dict[str, np.ndarray]:
     """Monte Carlo simulate one race n_sims times: each run, every driver
     either DNFs (drawn from p_dnf, classified at a position resampled from
     dnf_position_samples -- the empirical distribution of where retirees
     actually got classified historically) or finishes at
-    grid + delta_pred + Normal(0, residual_std) noise. Raw positions are
-    ranked within each run (argsort trick) so every run is a valid unique
-    1..N finishing order, then averaged into per-driver probabilities.
-    Fully vectorized: one (n_sims, n_drivers) array of draws, not a python
-    loop per simulation.
+    grid + delta_pred + Normal(0, residual_std) noise. residual_std can be a
+    single scalar (broadcast to every driver) or a per-driver array (e.g.
+    grid-bucket-dependent -- see residual_std_by_grid_bucket()/
+    grid_bucket_residual_std_array(), used because front-row finishes are
+    reliably noisier than mid-pack ones: see the module docstring's
+    calibration note). Raw positions are ranked within each run (argsort
+    trick) so every run is a valid unique 1..N finishing order, then
+    averaged into per-driver probabilities. Fully vectorized: one
+    (n_sims, n_drivers) array of draws, not a python loop per simulation.
     """
     n = len(grid)
     rng = np.random.default_rng(seed)
     grid_a = grid.to_numpy(dtype=float)
     delta_a = delta_pred.to_numpy(dtype=float)
     p_dnf_a = np.clip(p_dnf.to_numpy(dtype=float), 0.0, 1.0)
+    residual_std_a = np.maximum(np.broadcast_to(np.asarray(residual_std, dtype=float), (n,)), 1e-6)
 
     dnf_draw = rng.random((n_sims, n)) < p_dnf_a[None, :]
-    noise = rng.normal(0.0, max(residual_std, 1e-6), size=(n_sims, n))
+    noise = rng.normal(0.0, 1.0, size=(n_sims, n)) * residual_std_a[None, :]
     finisher_raw = grid_a[None, :] + delta_a[None, :] + noise
     samples = dnf_position_samples if len(dnf_position_samples) else np.array([grid_a.max()])
     dnf_raw = rng.choice(samples, size=(n_sims, n))
@@ -379,18 +436,15 @@ def summarise(preds: pd.DataFrame, grid_prob_table: pd.DataFrame) -> dict:
 # Walk-forward evaluation
 # --------------------------------------------------------------------------
 
-def evaluate(df: pd.DataFrame, min_train_races: int = 15, delta_params: dict | None = None,
-            dnf_params: dict | None = None, n_sims: int = 10_000,
-            seed: int = 42) -> tuple[pd.DataFrame, dict]:
-    """Runs the expanding-window walk-forward loop: at each fold, fits the
+def _walk_forward_raw(df: pd.DataFrame, min_train_races: int, delta_params: dict | None,
+                      dnf_params: dict | None) -> tuple[pd.DataFrame, dict[tuple, np.ndarray]]:
+    """The expanding-window walk-forward loop itself: at each fold, fits the
     delta regressor (on that fold's classified finishers only) and the DNF
-    classifier (on all of that fold's training rows), predicts the held-out
-    race, then Monte Carlo simulates it for win/podium/points probabilities.
-    Never trains on a race that hasn't happened yet relative to the race
-    being predicted. Returns (per-row predictions, {"residual_std": ...,
-    "dnf_position_prior": ...}) -- summarise() turns predictions into the
-    actual metrics dict; this function only produces the raw predictions.
-    """
+    classifier (on all of that fold's training rows), and predicts the
+    held-out race. Never trains on a race that hasn't happened yet relative
+    to the race being predicted. Returns raw per-row predictions (no Monte
+    Carlo/probabilities yet -- see _run_monte_carlo()) plus each race's
+    empirical DNF-position sample pool."""
     df = df.reset_index(drop=True)
     delta_params = delta_params or {}
     dnf_params = dnf_params or {}
@@ -425,45 +479,121 @@ def evaluate(df: pd.DataFrame, min_train_races: int = 15, delta_params: dict | N
 
     if not rows:
         raise ValueError(f"Not enough races for a single fold (need > {min_train_races})")
-    preds = pd.concat(rows, ignore_index=True)
+    return pd.concat(rows, ignore_index=True), dnf_samples_by_race
 
-    residual_std = float((preds.loc[preds[TARGET_DNF] == 0, "actual_delta"]
-                          - preds.loc[preds[TARGET_DNF] == 0, "delta_pred"]).std())
-    if not np.isfinite(residual_std) or residual_std <= 0:
-        residual_std = float(preds["actual_delta"].abs().mean()) or 1.0
 
+def _run_monte_carlo(preds: pd.DataFrame, dnf_samples_by_race: dict[tuple, np.ndarray],
+                     residual_std: float, bucket_stds: dict[str, float] | None = None,
+                     n_sims: int = 10_000, seed: int = 42) -> pd.DataFrame:
+    """Adds p_win/p_podium/p_points/expected_position columns by Monte Carlo
+    simulating every race in preds. residual_std is the scalar fallback;
+    pass bucket_stds (from residual_std_by_grid_bucket(), fit on dev only)
+    to additionally scale noise per grid bucket."""
+    preds = preds.copy()
     sim_cols = {"p_win": [], "p_podium": [], "p_points": [], "expected_position": []}
     for key, race in preds.groupby(GROUP_COLS, sort=False):
         samples = dnf_samples_by_race.get(key, np.array([race[TARGET_POS].max()]))
+        std = (grid_bucket_residual_std_array(race["grid"], bucket_stds, residual_std)
+              if bucket_stds is not None else residual_std)
         sim = simulate_positions(race["grid"], race["delta_pred"], race["p_dnf"], samples,
-                                 residual_std, n_sims=n_sims, seed=seed)
+                                 std, n_sims=n_sims, seed=seed)
         for k in sim_cols:
             sim_cols[k].append(pd.Series(sim[k], index=race.index))
     for k, parts in sim_cols.items():
         preds[k] = pd.concat(parts).sort_index()
+    return preds
 
+
+def _rank_and_flag(preds: pd.DataFrame) -> pd.DataFrame:
     preds = rank_within_race(preds, "expected_position", "model_pos")
     preds = rank_within_race(preds, "baseline_grid_pos_raw", "baseline_grid_pos")
     preds = rank_within_race(preds, "baseline_quali_pos_raw", "baseline_quali_pos")
     preds["model_points"] = preds["model_pos"] <= 10
     preds["baseline_grid_points"] = preds["baseline_grid_pos"] <= 10
     preds["baseline_quali_points"] = preds["baseline_quali_pos"] <= 10
+    return preds
+
+
+def evaluate(df: pd.DataFrame, min_train_races: int = 15, delta_params: dict | None = None,
+            dnf_params: dict | None = None, n_sims: int = 10_000,
+            seed: int = 42) -> tuple[pd.DataFrame, dict]:
+    """Walk-forward point predictions + Monte Carlo with a single global
+    residual_std (no grid-bucket noise, no isotonic calibration) -- used by
+    select_hyperparams()/select_dnf_hyperparams() and tests that only need a
+    quick, self-contained evaluation. run_full_evaluation() is the fuller
+    version used for the officially reported metrics (dev-only-fit bucket
+    noise + calibration, applied consistently to dev and holdout)."""
+    preds, dnf_samples_by_race = _walk_forward_raw(df, min_train_races, delta_params, dnf_params)
+
+    residual_std = float((preds.loc[preds[TARGET_DNF] == 0, "actual_delta"]
+                          - preds.loc[preds[TARGET_DNF] == 0, "delta_pred"]).std())
+    if not np.isfinite(residual_std) or residual_std <= 0:
+        residual_std = float(preds["actual_delta"].abs().mean()) or 1.0
+
+    preds = _run_monte_carlo(preds, dnf_samples_by_race, residual_std, n_sims=n_sims, seed=seed)
+    preds = _rank_and_flag(preds)
 
     meta = {"residual_std": round(residual_std, 4),
            "dnf_position_prior": round(float(preds["dnf_prior"].mean()), 3)}
     return preds, meta
 
 
+def _fit_dev_calibration(dev_df: pd.DataFrame, delta_params: dict | None = None,
+                         dnf_params: dict | None = None, min_train_races: int = 15,
+                         n_sims: int = 10_000, seed: int = 42) -> dict:
+    """Fits everything calibration-related on dev (2022-2024) walk-forward
+    CV ONLY: the global + grid-bucket residual std (see the module's
+    grid-bucket-noise note) and isotonic P(win)/P(podium) calibrators
+    (diagnosed necessary on top of bucket noise -- see README's "Race
+    outcome predictor" section for the before/after numbers). The returned
+    calibrators must then be applied unchanged to any other data (holdout,
+    a live prediction) -- never refit on it."""
+    dev_raw, dnf_samples_by_race = _walk_forward_raw(dev_df, min_train_races, delta_params, dnf_params)
+    finishers = dev_raw[dev_raw[TARGET_DNF] == 0]
+    residual_std = float((finishers["actual_delta"] - finishers["delta_pred"]).std())
+    if not np.isfinite(residual_std) or residual_std <= 0:
+        residual_std = float(dev_raw["actual_delta"].abs().mean()) or 1.0
+    bucket_stds = residual_std_by_grid_bucket(dev_raw)
+
+    dev_sim = _run_monte_carlo(dev_raw, dnf_samples_by_race, residual_std, bucket_stds=bucket_stds,
+                              n_sims=n_sims, seed=seed)
+    actual_win = (dev_sim[TARGET_POS] == 1).astype(int)
+    actual_podium = (dev_sim[TARGET_POS] <= 3).astype(int)
+    win_calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(
+        dev_sim["p_win"], actual_win)
+    podium_calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(
+        dev_sim["p_podium"], actual_podium)
+
+    return {
+        "residual_std": round(residual_std, 4),
+        "residual_std_by_bucket": {k: round(v, 4) for k, v in bucket_stds.items()},
+        "win_calibrator": win_calibrator,
+        "podium_calibrator": podium_calibrator,
+    }
+
+
 def run_full_evaluation(df: pd.DataFrame, delta_params: dict | None = None, dnf_params: dict | None = None,
                         min_train_races: int = 15, n_sims: int = 10_000, seed: int = 42) -> dict:
     """The full reported evaluation: one walk-forward pass across the whole
-    timeline (causal throughout), then the resulting predictions are split
-    by season into dev (2022-2024) and holdout (2025-2026) and summarised
-    separately. The holdout numbers here are meant to be looked at ONCE --
-    see the module docstring."""
+    timeline (causal throughout) for delta/DNF point predictions, but the
+    Monte Carlo noise scheme and P(win)/P(podium) isotonic calibrators are
+    fit on dev (2022-2024) ONLY (_fit_dev_calibration) and then applied
+    unchanged to every race, dev and holdout alike -- holdout never
+    contributes to its own calibration. Predictions are then split by
+    season into dev and holdout and summarised separately. The holdout
+    numbers here are meant to be looked at ONCE -- see the module
+    docstring."""
     dev_df, _ = dev_holdout_split(df)
     grid_prob_table = empirical_grid_probs(dev_df)
-    preds, meta = evaluate(df, min_train_races, delta_params, dnf_params, n_sims=n_sims, seed=seed)
+
+    preds_raw, dnf_samples_by_race = _walk_forward_raw(df, min_train_races, delta_params, dnf_params)
+    calib = _fit_dev_calibration(dev_df, delta_params, dnf_params, min_train_races, n_sims, seed)
+
+    preds = _run_monte_carlo(preds_raw, dnf_samples_by_race, calib["residual_std"],
+                             bucket_stds=calib["residual_std_by_bucket"], n_sims=n_sims, seed=seed)
+    preds["p_win"] = calib["win_calibrator"].predict(preds["p_win"])
+    preds["p_podium"] = calib["podium_calibrator"].predict(preds["p_podium"])
+    preds = _rank_and_flag(preds)
 
     dev_preds = preds[preds["season"] <= DEV_SEASON_MAX]
     holdout_preds = preds[preds["season"] > DEV_SEASON_MAX]
@@ -471,8 +601,9 @@ def run_full_evaluation(df: pd.DataFrame, delta_params: dict | None = None, dnf_
     report = {
         "n_races": int(preds[GROUP_COLS].drop_duplicates().shape[0]),
         "n_rows": int(len(preds)),
-        "residual_std": meta["residual_std"],
-        "dnf_position_prior": meta["dnf_position_prior"],
+        "residual_std": calib["residual_std"],
+        "residual_std_by_bucket": calib["residual_std_by_bucket"],
+        "dnf_position_prior": round(float(preds["dnf_prior"].mean()), 3),
         "dev": summarise(dev_preds, grid_prob_table),
         "holdout": summarise(holdout_preds, grid_prob_table),
         "by_season": {str(season): summarise(g, grid_prob_table) for season, g in preds.groupby("season")},
@@ -619,10 +750,15 @@ def _quick_residual_std(df: pd.DataFrame, delta_params: dict | None = None, hold
 
 
 def fit_final(df: pd.DataFrame, delta_params: dict | None = None,
-             dnf_params: dict | None = None) -> tuple[Pipeline, Pipeline, dict]:
+             dnf_params: dict | None = None, fit_calibration: bool = True) -> tuple[Pipeline, Pipeline, dict]:
     """Fit delta + DNF pipelines on ALL of df -- no CV/holdout. This is the
     model actually used for real predictions, as opposed to the
-    walk-forward copies fit inside evaluate() purely for honest metrics."""
+    walk-forward copies fit inside evaluate() purely for honest metrics.
+    meta's residual_std_by_bucket/win_calibrator/podium_calibrator are fit
+    on dev (2022-2024) walk-forward CV ONLY, per _fit_dev_calibration()'s
+    leakage rule -- set fit_calibration=False to skip that (much slower)
+    step when only the point-prediction pipelines are needed (e.g. some
+    tests)."""
     train_delta = df[df[TARGET_DNF] == 0].dropna(subset=[TARGET_DELTA])
     train_dnf = df.dropna(subset=[TARGET_DNF])
     delta_pipe = make_delta_pipeline(**(delta_params or {})).fit(_prep_delta(train_delta), train_delta[TARGET_DELTA])
@@ -631,10 +767,23 @@ def fit_final(df: pd.DataFrame, delta_params: dict | None = None,
     dnf_rows = df.loc[df[TARGET_DNF] == 1, TARGET_POS].dropna()
     meta = {
         "residual_std": _quick_residual_std(df, delta_params),
+        "residual_std_by_bucket": None,
         "dnf_position_prior": float(dnf_rows.mean()) if len(dnf_rows) else float(df[TARGET_POS].max()),
         "dnf_position_samples": (dnf_rows.tolist() if len(dnf_rows) >= 5
                                  else [float(dnf_rows.mean()) if len(dnf_rows) else float(df[TARGET_POS].max())]),
+        "win_calibrator": None,
+        "podium_calibrator": None,
     }
+    if fit_calibration:
+        dev_df, _ = dev_holdout_split(df)
+        try:
+            calib = _fit_dev_calibration(dev_df, delta_params, dnf_params)
+            meta["residual_std"] = calib["residual_std"]
+            meta["residual_std_by_bucket"] = calib["residual_std_by_bucket"]
+            meta["win_calibrator"] = calib["win_calibrator"]
+            meta["podium_calibrator"] = calib["podium_calibrator"]
+        except ValueError:
+            pass  # not enough dev races for a single fold (e.g. a tiny synthetic test dataset)
     return delta_pipe, dnf_pipe, meta
 
 
@@ -648,63 +797,181 @@ def train(df: pd.DataFrame, delta_params: dict | None = None, dnf_params: dict |
     dnf_params = dnf_params or DEFAULT_DNF_PARAMS
     delta_pipe, dnf_pipe, meta = fit_final(df, delta_params, dnf_params)
     report = run_full_evaluation(df, delta_params, dnf_params)
-    # Prefer the walk-forward (honest, out-of-sample-across-many-folds)
-    # residual_std over the quick single-split estimate, now that we have it.
-    meta["residual_std"] = report["residual_std"]
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(delta_pipe, MODEL_DELTA_PATH)
-    joblib.dump(dnf_pipe, MODEL_DNF_PATH)
-    META_PATH.write_text(json.dumps(meta))
+    joblib.dump({"delta_pipe": delta_pipe, "dnf_pipe": dnf_pipe, "meta": meta}, MODEL_BUNDLE_PATH)
     METRICS_PATH.write_text(json.dumps(report, indent=2))
     return report
 
 
 def load_models():
-    if not (MODEL_DELTA_PATH.exists() and MODEL_DNF_PATH.exists() and META_PATH.exists()):
+    if not MODEL_BUNDLE_PATH.exists():
         return None, None, None
-    meta = json.loads(META_PATH.read_text())
-    meta["dnf_position_samples"] = np.array(meta["dnf_position_samples"])
-    return joblib.load(MODEL_DELTA_PATH), joblib.load(MODEL_DNF_PATH), meta
+    bundle = joblib.load(MODEL_BUNDLE_PATH)
+    return bundle["delta_pipe"], bundle["dnf_pipe"], bundle["meta"]
 
 
 def ensure_trained(dataset_path) -> tuple[Pipeline, Pipeline, dict]:
-    """Load cached models if present, else fit fresh from the dataset at
-    dataset_path (fast -- no walk-forward evaluation) and cache the result.
-    Models are gitignored (regenerable, not source), so every consumer --
-    the predict script, the API, the dashboard -- can be self-sufficient
-    from just the small committed dataset parquet, with no pre-committed
-    model artifact needed anywhere (local dev, CI, or Streamlit Cloud)."""
+    """Prefers the committed frozen model (see freeze_model()/
+    load_frozen_model()) if one exists -- that's the one genuinely "live"
+    model now, per the freeze. Falls back to a cached fast self-trained
+    model, else fits fresh from the dataset at dataset_path (fast -- no
+    walk-forward evaluation) and caches the result. The fast-train path
+    exists so a fresh checkout/deploy before any freeze, or a test, is
+    never stuck without a usable model."""
+    if FROZEN_BUNDLE_PATH.exists():
+        return load_frozen_model()
     delta_pipe, dnf_pipe, meta = load_models()
     if delta_pipe is not None:
         return delta_pipe, dnf_pipe, meta
     df = pd.read_parquet(dataset_path)
     delta_pipe, dnf_pipe, meta = fit_final(df)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(delta_pipe, MODEL_DELTA_PATH)
-    joblib.dump(dnf_pipe, MODEL_DNF_PATH)
-    META_PATH.write_text(json.dumps(meta))
+    joblib.dump({"delta_pipe": delta_pipe, "dnf_pipe": dnf_pipe, "meta": meta}, MODEL_BUNDLE_PATH)
     return delta_pipe, dnf_pipe, meta
+
+
+# --------------------------------------------------------------------------
+# Freezing: a deliberate, rare, manual snapshot -- never done automatically
+# by a test, a script's default path, or a CI job. Once frozen,
+# ensure_trained() (and therefore the API route, the dashboard, and
+# scripts/predict_next_race.py) always uses this exact committed model,
+# not whatever a fresh self-train from the current dataset would produce.
+# That's what makes the "live track record since {frozen_at}" (see
+# compute_live_track_record()) a genuinely clean, un-touched-by-further-
+# tuning test going forward.
+# --------------------------------------------------------------------------
+
+def _dataset_sha256(dataset_path) -> str:
+    return hashlib.sha256(Path(dataset_path).read_bytes()).hexdigest()
+
+
+def freeze_model(df: pd.DataFrame, dataset_path, version: str, notes: str = "",
+                 delta_params: dict | None = None, dnf_params: dict | None = None,
+                 frozen_at: str | None = None) -> dict:
+    """Trains the final delta/DNF pipelines (weights on ALL of df; Monte
+    Carlo noise + P(win)/P(podium) calibration on dev/2022-2024 CV only,
+    via fit_final()) and commits them as the frozen snapshot at
+    FROZEN_BUNDLE_PATH/FROZEN_SPEC_PATH. Run via
+    `python -m scripts.freeze_race_predictor`, not automatically."""
+    delta_params = delta_params or DEFAULT_DELTA_PARAMS
+    dnf_params = dnf_params or DEFAULT_DNF_PARAMS
+    delta_pipe, dnf_pipe, meta = fit_final(df, delta_params, dnf_params)
+    frozen_at = frozen_at or date.today().isoformat()
+
+    FROZEN_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"delta_pipe": delta_pipe, "dnf_pipe": dnf_pipe, "meta": meta}, FROZEN_BUNDLE_PATH)
+
+    spec = {
+        "version": version,
+        "frozen_at": frozen_at,
+        "dataset_sha256": _dataset_sha256(dataset_path),
+        "n_rows": int(len(df)),
+        "delta_params": delta_params,
+        "dnf_params": dnf_params,
+        "residual_std": meta["residual_std"],
+        "residual_std_by_bucket": meta["residual_std_by_bucket"],
+        "dnf_position_prior": meta["dnf_position_prior"],
+        "notes": notes,
+    }
+    FROZEN_SPEC_PATH.write_text(json.dumps(spec, indent=2))
+    return spec
+
+
+def load_frozen_model() -> tuple[Pipeline, Pipeline, dict]:
+    if not FROZEN_BUNDLE_PATH.exists():
+        raise FileNotFoundError(
+            f"No frozen model at {FROZEN_BUNDLE_PATH} -- run "
+            "`python -m scripts.freeze_race_predictor` first.")
+    bundle = joblib.load(FROZEN_BUNDLE_PATH)
+    return bundle["delta_pipe"], bundle["dnf_pipe"], bundle["meta"]
+
+
+def frozen_model_spec() -> dict | None:
+    """The committed spec.json (version, frozen_at, hyperparams, dataset
+    hash, ...) if a model has been frozen, else None."""
+    if not FROZEN_SPEC_PATH.exists():
+        return None
+    return json.loads(FROZEN_SPEC_PATH.read_text())
 
 
 def predict_race(delta_pipe, dnf_pipe, race_features: pd.DataFrame, meta: dict,
                  n_sims: int = 10_000, seed: int | None = None) -> pd.DataFrame:
     """race_features: one row per driver for a single upcoming race (same
     columns as the training features, plus "driver" and "grid" for display).
-    Monte Carlo simulates the race and returns race_features with
+    Monte Carlo simulates the race (grid-bucket-dependent noise if
+    meta["residual_std_by_bucket"] is set) and returns race_features with
     predicted_position (unique 1..N, ranked by expected position),
-    win_probability, podium_probability and points_probability added,
+    win_probability, podium_probability and points_probability added
+    (win/podium isotonic-calibrated if meta has those calibrators),
     sorted by predicted_position.
     """
     out = race_features.copy()
     out["delta_pred"] = delta_pipe.predict(_prep_delta(out))
     out["p_dnf"] = dnf_pipe.predict_proba(_prep_dnf(out))[:, 1]
+    bucket_stds = meta.get("residual_std_by_bucket")
+    std = (grid_bucket_residual_std_array(out["grid"], bucket_stds, meta["residual_std"])
+          if bucket_stds else meta["residual_std"])
     sim = simulate_positions(out["grid"], out["delta_pred"], out["p_dnf"],
-                             meta["dnf_position_samples"], meta["residual_std"],
-                             n_sims=n_sims, seed=seed)
-    out["win_probability"] = sim["p_win"]
-    out["podium_probability"] = sim["p_podium"]
+                             meta["dnf_position_samples"], std, n_sims=n_sims, seed=seed)
+    win_cal, podium_cal = meta.get("win_calibrator"), meta.get("podium_calibrator")
+    out["win_probability"] = win_cal.predict(sim["p_win"]) if win_cal is not None else sim["p_win"]
+    out["podium_probability"] = podium_cal.predict(sim["p_podium"]) if podium_cal is not None else sim["p_podium"]
     out["points_probability"] = sim["p_points"]
     out["expected_position"] = sim["expected_position"]
     out = rank_within_race(out, "expected_position", "predicted_position", group_cols=None)
     return out.sort_values("predicted_position").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# Live track record since the freeze -- the clean, genuinely prospective
+# test: only predictions/{year}.csv rows logged at/after frozen_at, which by
+# construction were made by the frozen model (predict_next_race.py loads
+# only that model -- see load_frozen_model()), scored against real results.
+# --------------------------------------------------------------------------
+
+def compute_live_track_record(frozen_at: str) -> dict | None:
+    """Reads every predictions/{year}.csv, keeps rows predicted at/after
+    frozen_at, and scores the ones with a real result in yet. Returns None
+    if nothing has been predicted since the freeze yet (a fresh freeze, or
+    before the next scheduled prediction run) -- callers should render that
+    as "no races yet", not fabricate a metric from zero rows."""
+    if not PREDICTIONS_DIR.exists():
+        return None
+    frames = [pd.read_csv(p) for p in sorted(PREDICTIONS_DIR.glob("*.csv"))]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return None
+
+    all_preds = pd.concat(frames, ignore_index=True)
+    all_preds["predicted_at"] = pd.to_datetime(all_preds["predicted_at"], utc=True)
+    cutoff = pd.Timestamp(frozen_at)
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+    live = all_preds[all_preds["predicted_at"] >= cutoff]
+    if live.empty:
+        return None
+
+    out = {"frozen_at": frozen_at, "n_races_predicted": int(live["gp"].nunique())}
+    scored = live.dropna(subset=["actual_position"])
+    out["n_races_scored"] = int(scored["gp"].nunique())
+    out["n_rows_scored"] = int(len(scored))
+    if scored.empty:
+        return out
+
+    out["model_mae"] = round(float((scored["predicted_position"] - scored["actual_position"]).abs().mean()), 3)
+    out["grid_mae"] = round(float((scored["grid"] - scored["actual_position"]).abs().mean()), 3)
+    pred_winners = scored[scored["predicted_position"] == 1]
+    out["model_winner_accuracy"] = (round(float((pred_winners["actual_position"] == 1).mean()), 3)
+                                    if not pred_winners.empty else None)
+    if "win_probability" in scored:
+        actual_win = (scored["actual_position"] == 1).astype(int)
+        out["win_brier"] = round(float(brier_score_loss(actual_win, scored["win_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    if "podium_probability" in scored:
+        actual_podium = (scored["actual_position"] <= 3).astype(int)
+        out["podium_brier"] = round(float(brier_score_loss(
+            actual_podium, scored["podium_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    if "points_probability" in scored:
+        actual_points = (scored["actual_position"] <= 10).astype(int)
+        out["points_brier"] = round(float(brier_score_loss(
+            actual_points, scored["points_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    return out
