@@ -190,9 +190,15 @@ def _add_within_race_features(df: pd.DataFrame) -> pd.DataFrame:
         gap[d2["driver"]] = d2["quali_best_s"] - d1["quali_best_s"]
     df["teammate_quali_gap_s"] = df["driver"].map(gap)
 
+    # Pit-lane start = back of grid, i.e. the number of cars that actually
+    # started this race (== len(df) here, one row per starter). NOT
+    # max(everyone else's raw grid number) + 1: that number can have gaps
+    # (grid numbers aren't renumbered when someone else also starts from the
+    # pit lane) and so can overshoot the real field size -- confirmed on a
+    # real race (2022 round 5, 20 starters incl. 2 pit-lane: the old logic
+    # produced grid=21 in a 20-car field).
     df["grid_pit_lane"] = df["grid"] == 0
-    field_size = df.loc[~df["grid_pit_lane"], "grid"].max()
-    df["grid"] = df["grid"].where(~df["grid_pit_lane"], field_size + 1)
+    df["grid"] = df["grid"].where(~df["grid_pit_lane"], len(df))
 
     df["dnf"] = (df["laps_completed"] < 0.9 * df["race_max_laps"]).astype(float)
     return df
