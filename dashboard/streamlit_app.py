@@ -28,6 +28,7 @@ from app.models.race_predictor import DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS  
 from app.models.race_predictor import FEATURES_DELTA, FEATURES_DNF, TARGET_DELTA, TARGET_DNF  # noqa: E402
 from app.models.race_predictor import _prep_delta, _prep_dnf  # noqa: E402
 from app.models.race_predictor import ensure_trained, predict_race, run_full_evaluation  # noqa: E402
+from app.models.race_predictor import compute_live_track_record, frozen_model_spec  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
@@ -332,6 +333,35 @@ def render_view() -> None:
                       f"{holdout_model['position_mae']} vs grid baseline {holdout_grid['position_mae']} -- "
                       "see the README's \"Race outcome predictor\" section for the full honest comparison "
                       "(point + probabilistic metrics) against both baselines.")
+
+        spec = frozen_model_spec()
+        if spec:
+            frozen_at = spec["frozen_at"]
+            st.subheader(f"Live track record since {frozen_at}")
+            st.caption(f"Model v{spec['version']}, frozen {frozen_at} -- no further tuning since. "
+                      "Only predictions logged at or after this date count, so this is a genuinely "
+                      "prospective test, not another look at CV data.")
+            live = compute_live_track_record(frozen_at)
+            if live is None:
+                st.info("No races predicted since the freeze yet -- this fills in as the weekly "
+                       "Action logs and scores predictions going forward.")
+            elif live["n_races_scored"] == 0:
+                st.info(f"{live['n_races_predicted']} race(s) predicted since the freeze, "
+                       "none scored yet (race hasn't happened / results not in yet).")
+            else:
+                cols = st.columns(4)
+                cols[0].metric("Races scored", live["n_races_scored"])
+                cols[1].metric("Model MAE", live["model_mae"], delta=round(live["model_mae"] - live["grid_mae"], 3),
+                              delta_color="inverse")
+                cols[2].metric("Grid MAE", live["grid_mae"])
+                if live.get("model_winner_accuracy") is not None:
+                    cols[3].metric("Winner accuracy", f"{live['model_winner_accuracy']:.0%}")
+                brier_bits = [f"win {live['win_brier']}" if "win_brier" in live else None,
+                            f"podium {live['podium_brier']}" if "podium_brier" in live else None,
+                            f"points {live['points_brier']}" if "points_brier" in live else None]
+                brier_bits = [b for b in brier_bits if b]
+                if brier_bits:
+                    st.caption("Brier (lower is better): " + ", ".join(brier_bits))
 
 
 try:

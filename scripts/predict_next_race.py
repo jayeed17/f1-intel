@@ -26,6 +26,14 @@ Auto-detect mode exits 0 with a message (not a failure) if no qualifying
 session happened in the last 2 days -- a bye week is not an error. If a
 qualifying session DID happen but its data can't be fetched from any
 source, that's a real failure and this exits non-zero.
+
+Uses ONLY the frozen model (load_frozen_model(), data/model/frozen/) --
+never a freshly self-trained one -- so every logged prediction comes from
+the exact same model, making predictions/{year}.csv's post-freeze rows a
+genuinely clean prospective track record (see the dashboard/README's "Live
+track record since {frozen_at}" section). Exits non-zero if nothing has
+been frozen yet (see scripts/freeze_race_predictor.py) rather than
+silently falling back to a different model.
 """
 from __future__ import annotations
 
@@ -34,9 +42,9 @@ import argparse
 import fastf1
 import pandas as pd
 
-from app.config import PREDICTIONS_DIR, RACE_DATASET_PATH
+from app.config import PREDICTIONS_DIR
 from app.data import race_prediction_features
-from app.models.race_predictor import ensure_trained, predict_race
+from app.models.race_predictor import load_frozen_model, predict_race
 
 
 def _auto_detect_next_race(now: pd.Timestamp) -> tuple[int, str, str | None] | None:
@@ -81,9 +89,10 @@ def main() -> None:
             return
         year, gp, circuit_id = detected
 
-    if not RACE_DATASET_PATH.exists():
-        raise SystemExit(f"No dataset at {RACE_DATASET_PATH} -- run scripts/build_race_dataset.py first.")
-    delta_pipe, dnf_pipe, meta = ensure_trained(RACE_DATASET_PATH)
+    try:
+        delta_pipe, dnf_pipe, meta = load_frozen_model()
+    except FileNotFoundError as e:
+        raise SystemExit(str(e)) from e
 
     features = race_prediction_features(year, gp, circuit_id)
     preds = predict_race(delta_pipe, dnf_pipe, features, meta)

@@ -6,9 +6,9 @@ import pytest
 from app.models.race_predictor import (
     DEV_SEASON_MAX, GROUP_COLS, TARGET_DELTA, TARGET_DNF, _prep_delta, _prep_dnf,
     bootstrap_diff_ci, dev_holdout_split, empirical_grid_probs, evaluate, fit_final,
-    make_delta_pipeline, make_dnf_pipeline, predict_race, rank_within_race, race_sequence,
-    run_full_evaluation, select_dnf_hyperparams, select_hyperparams, simulate_positions,
-    time_based_splits,
+    grid_bucket_residual_std_array, make_delta_pipeline, make_dnf_pipeline, predict_race,
+    rank_within_race, race_sequence, residual_std_by_grid_bucket, run_full_evaluation,
+    select_dnf_hyperparams, select_hyperparams, simulate_positions, time_based_splits,
 )
 
 
@@ -128,6 +128,36 @@ def test_empirical_grid_probs_bounded_and_present():
     assert pole_row["p_win"] >= back_row["p_win"]
 
 
+def test_residual_std_by_grid_bucket_and_array_mapping():
+    """residual_std_by_grid_bucket() should report a materially different
+    std for a bucket whose residuals actually are wider (constructed here
+    directly, rather than relying on the fixture's incidental noise
+    pattern), and grid_bucket_residual_std_array() should map each row to
+    its own bucket's value."""
+    rng = np.random.default_rng(0)
+    n_per_bucket = 40
+    grids = np.concatenate([rng.integers(1, 4, n_per_bucket),      # bucket "1-3"
+                            rng.integers(4, 11, n_per_bucket),     # bucket "4-10"
+                            rng.integers(11, 21, n_per_bucket)])   # bucket "11+"
+    # Wide noise for the front, narrow for mid-pack, medium for the back.
+    noise_std = np.concatenate([np.full(n_per_bucket, 6.0), np.full(n_per_bucket, 1.0),
+                                np.full(n_per_bucket, 3.0)])
+    delta_pred = np.zeros(len(grids))
+    actual_delta = rng.normal(0, noise_std)
+    preds = pd.DataFrame({
+        "grid": grids, "delta_pred": delta_pred, TARGET_DNF: 0.0,
+        "target_finish_pos": grids + delta_pred + actual_delta,
+    })
+    bucket_stds = residual_std_by_grid_bucket(preds)
+    assert bucket_stds["1-3"] > bucket_stds["11+"] > bucket_stds["4-10"]
+
+    grid = pd.Series([2.0, 7.0, 15.0])
+    arr = grid_bucket_residual_std_array(grid, bucket_stds, fallback=1.0)
+    assert arr[0] == pytest.approx(bucket_stds["1-3"])
+    assert arr[1] == pytest.approx(bucket_stds["4-10"])
+    assert arr[2] == pytest.approx(bucket_stds["11+"])
+
+
 def test_simulate_positions_produces_valid_probabilities():
     n = 10
     grid = pd.Series(np.arange(1, n + 1, dtype=float))
@@ -235,8 +265,13 @@ def test_prep_handles_all_nan_numeric_column():
 
 
 def test_predict_race_ranks_single_race_and_probabilities():
+    """fit_calibration=False here: this test is about predict_race()'s
+    ranking/shape contract (a raw MC simulation's win probabilities sum to
+    exactly 1 across the field), not calibration -- isotonic calibration is
+    fit per-probability-value on pooled cross-race data, so it does NOT
+    preserve that sum-to-1 invariant (see the calibrated variant below)."""
     df = fake_race_dataset(n_seasons=4, n_rounds=10)
-    delta_pipe, dnf_pipe, meta = fit_final(df)
+    delta_pipe, dnf_pipe, meta = fit_final(df, fit_calibration=False)
     next_race = df[df["round"] == 1].drop_duplicates("driver").copy()
 
     out = predict_race(delta_pipe, dnf_pipe, next_race, meta, n_sims=3000, seed=7)
@@ -247,23 +282,112 @@ def test_predict_race_ranks_single_race_and_probabilities():
     assert list(out["predicted_position"]) == list(out["predicted_position"].sort_values())
 
 
+def test_predict_race_with_calibration_uses_bucket_noise_and_calibrators():
+    """fit_calibration=True (the default): meta should carry a per-bucket
+    residual std and fitted win/podium calibrators, and predict_race()
+    should actually use them (calibrated probabilities differ from the raw
+    simulation, still valid probabilities, though no longer constrained to
+    sum to 1 across the field -- see the note above)."""
+    df = fake_race_dataset(n_seasons=5, n_rounds=8, n_drivers=14)  # spans into holdout for dev/holdout split
+    delta_pipe, dnf_pipe, meta = fit_final(df)
+    assert meta["residual_std_by_bucket"] is not None
+    assert meta["win_calibrator"] is not None and meta["podium_calibrator"] is not None
+
+    next_race = df[df["round"] == 1].drop_duplicates("driver").copy()
+    out = predict_race(delta_pipe, dnf_pipe, next_race, meta, n_sims=3000, seed=7)
+    assert sorted(out["predicted_position"]) == list(range(1, len(out) + 1))
+    for col in ("win_probability", "podium_probability", "points_probability"):
+        assert out[col].between(0, 1).all()
+
+
 def test_train_writes_model_and_metrics(tmp_path, monkeypatch):
     from app.models import race_predictor as rp
 
     monkeypatch.setattr(rp, "MODEL_DIR", tmp_path)
-    monkeypatch.setattr(rp, "MODEL_DELTA_PATH", tmp_path / "delta.joblib")
-    monkeypatch.setattr(rp, "MODEL_DNF_PATH", tmp_path / "dnf.joblib")
-    monkeypatch.setattr(rp, "META_PATH", tmp_path / "meta.json")
+    monkeypatch.setattr(rp, "MODEL_BUNDLE_PATH", tmp_path / "bundle.joblib")
     monkeypatch.setattr(rp, "METRICS_PATH", tmp_path / "metrics.json")
 
     df = fake_race_dataset(n_seasons=3, n_rounds=8)  # all dev seasons -- holdout will be empty
     report = rp.train(df)
 
-    assert (tmp_path / "delta.joblib").exists()
-    assert (tmp_path / "dnf.joblib").exists()
-    assert (tmp_path / "meta.json").exists()
+    assert (tmp_path / "bundle.joblib").exists()
     assert (tmp_path / "metrics.json").exists()
     assert report["n_races"] > 0
     delta_pipe, dnf_pipe, meta = rp.load_models()
     assert delta_pipe is not None and dnf_pipe is not None
     assert "residual_std" in meta and len(meta["dnf_position_samples"]) > 0
+
+
+def test_freeze_and_load_frozen_model(tmp_path, monkeypatch):
+    from app.models import race_predictor as rp
+
+    dataset_path = tmp_path / "race_dataset.parquet"
+    df = fake_race_dataset(n_seasons=5, n_rounds=8, n_drivers=14)
+    df.to_parquet(dataset_path)
+
+    monkeypatch.setattr(rp, "FROZEN_MODEL_DIR", tmp_path / "frozen")
+    monkeypatch.setattr(rp, "FROZEN_BUNDLE_PATH", tmp_path / "frozen" / "model.joblib")
+    monkeypatch.setattr(rp, "FROZEN_SPEC_PATH", tmp_path / "frozen" / "spec.json")
+
+    assert rp.frozen_model_spec() is None
+    with pytest.raises(FileNotFoundError):
+        rp.load_frozen_model()
+
+    spec = rp.freeze_model(df, dataset_path, version="9.9.9", notes="test freeze", frozen_at="2026-01-01")
+    assert spec["version"] == "9.9.9"
+    assert spec["frozen_at"] == "2026-01-01"
+    assert len(spec["dataset_sha256"]) == 64
+
+    loaded_spec = rp.frozen_model_spec()
+    assert loaded_spec == spec
+
+    delta_pipe, dnf_pipe, meta = rp.load_frozen_model()
+    assert delta_pipe is not None and dnf_pipe is not None
+    assert meta["win_calibrator"] is not None
+
+    # ensure_trained() must prefer the frozen model once one exists.
+    _, _, meta2 = rp.ensure_trained(dataset_path)
+    assert meta2["residual_std"] == meta["residual_std"]
+
+
+def test_compute_live_track_record(tmp_path, monkeypatch):
+    from app.models import race_predictor as rp
+
+    predictions_dir = tmp_path / "predictions"
+    predictions_dir.mkdir()
+    monkeypatch.setattr(rp, "PREDICTIONS_DIR", predictions_dir)
+
+    frozen_at = "2026-06-01"
+    assert rp.compute_live_track_record(frozen_at) is None  # no predictions logged at all
+
+    rows = pd.DataFrame({
+        "predicted_at": ["2026-05-01T00:00:00+00:00", "2026-06-02T00:00:00+00:00",
+                        "2026-06-02T00:00:00+00:00"],
+        "gp": ["Before Freeze GP", "After Freeze GP", "After Freeze GP"],
+        "driver": ["D0", "D0", "D1"],
+        "team_id": ["T0", "T0", "T1"],
+        "grid": [1, 1, 2],
+        "predicted_position": [1, 1, 2],
+        "win_probability": [0.5, 0.5, 0.1],
+        "podium_probability": [0.8, 0.8, 0.3],
+        "points_probability": [0.9, 0.9, 0.6],
+        "actual_position": [1, None, None],
+        "scored_at": ["2026-05-02T00:00:00+00:00", None, None],
+    })
+    rows.to_csv(predictions_dir / "2026.csv", index=False)
+
+    # Only the post-freeze race counts, and it's not scored yet.
+    live = rp.compute_live_track_record(frozen_at)
+    assert live is not None
+    assert live["n_races_predicted"] == 1
+    assert live["n_races_scored"] == 0
+
+    # Now score the post-freeze race and confirm the metrics populate.
+    rows.loc[rows["gp"] == "After Freeze GP", "actual_position"] = [1, 3]
+    rows.to_csv(predictions_dir / "2026.csv", index=False)
+    live = rp.compute_live_track_record(frozen_at)
+    assert live["n_races_scored"] == 1
+    assert live["n_rows_scored"] == 2
+    assert live["model_mae"] == pytest.approx(0.5)
+    assert live["model_winner_accuracy"] == 1.0
+    assert "win_brier" in live and "podium_brier" in live and "points_brier" in live
