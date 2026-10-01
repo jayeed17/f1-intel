@@ -71,3 +71,11 @@ CIRCUIT_TYPE = {
 # form (rolling features) carries over less than usual.
 REG_CHANGE_SEASONS = {2022, 2026}
 REG_CHANGE_ROUNDS = 3  # first N rounds of a reset season get the flag
+
+# circuit_id -> first season under a materially different layout. Circuit
+# history (app/models/*_predictor.py's circuit-history features) treats the
+# circuit as brand-new starting that season -- editions before it don't
+# count as "prior history here", even though Ergast/Jolpica keeps the same
+# circuitId across the layout change. 2026 Spanish GP moves from Catalunya's
+# old full layout to a reconfigured one.
+CIRCUIT_HISTORY_RESET = {"catalunya": 2026}

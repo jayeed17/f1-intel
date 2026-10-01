@@ -47,8 +47,8 @@ import numpy as np
 import pandas as pd
 from fastf1.exceptions import ErgastInvalidRequestError, RateLimitExceededError
 
-from app.config import (CIRCUIT_TYPE, MODEL_DATA_DIR, RACE_DATASET_PATH, REG_CHANGE_ROUNDS,
-                        REG_CHANGE_SEASONS, TEAM_ID)
+from app.config import (CIRCUIT_HISTORY_RESET, CIRCUIT_TYPE, MODEL_DATA_DIR, RACE_DATASET_PATH,
+                        REG_CHANGE_ROUNDS, REG_CHANGE_SEASONS, TEAM_ID)
 from app.data import PrebuiltSession, _resolve_prebuilt, clean_laps, prebuilt_races
 
 DATASET_PATH = RACE_DATASET_PATH  # kept as a local alias; this is the name scripts/tests already use
@@ -93,6 +93,17 @@ FINAL_COLUMNS = [
     "driver_dnf_rate_10", "team_dnf_rate_10",
     "circuit_type", "reg_change_flag", "dnf", "source",
     "target_finish_pos", "target_points_top10", "target_delta",
+    # circuit history (last 3 prior editions of this exact circuit identity)
+    "circuit_new_or_changed",
+    "driver_circuit_avg_quali_3", "driver_circuit_avg_finish_3",
+    "driver_circuit_races_here", "driver_circuit_hist_pre_reg_change",
+    "team_circuit_avg_quali_3", "team_circuit_avg_finish_3",
+    "team_circuit_races_here", "team_circuit_hist_pre_reg_change",
+    # rolling qualifying form
+    "driver_rolling_quali_position_3", "driver_rolling_quali_position_5",
+    "team_rolling_quali_position_3", "teammate_quali_gap_trend_3",
+    # practice pace (FP2+FP3, prebuilt-laps-only, NaN wherever not prebuilt)
+    "fp_best_gap_s", "fp_long_run_gap_s",
 ]
 
 
@@ -301,6 +312,164 @@ def add_delta_and_team_dnf_features(df: pd.DataFrame) -> pd.DataFrame:
                     on=["season", "round", "team_id"], how="left")
 
 
+def _reg_era(season: int) -> int:
+    """Which regulation era `season` belongs to -- the latest reg-change
+    season at or before it, or 0 if there isn't one yet. Two seasons in the
+    same era are "the same rules generation" for this feature's purposes."""
+    era = 0
+    for e in sorted(REG_CHANGE_SEASONS):
+        if season >= e:
+            era = e
+    return era
+
+
+def _history_key(circuit_id: str | None, season: int) -> str | None:
+    """circuit_id, unless CIRCUIT_HISTORY_RESET says this circuit got a
+    materially different layout starting some season -- then editions at or
+    after that season use a distinct key, so they never pick up history
+    from the old layout (and the old layout's rows never see the new one)."""
+    if circuit_id is None:
+        return None
+    reset_season = CIRCUIT_HISTORY_RESET.get(circuit_id)
+    if reset_season is not None and season >= reset_season:
+        return f"{circuit_id}__since{reset_season}"
+    return circuit_id
+
+
+def add_circuit_history_and_quali_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Circuit history (driver/team avg quali position + avg finish at this
+    exact circuit identity, over up to the last 3 PRIOR editions -- strictly
+    earlier seasons, never this one) plus rolling qualifying-form features.
+    Pulled out as its own function (same reason as
+    add_delta_and_team_dnf_features): re-appliable to an already-built
+    dataset.parquet without a full network rebuild.
+
+    Circuit "identity" is circuit_id, except where CIRCUIT_HISTORY_RESET
+    marks a layout change (_history_key) -- the reset season, like a
+    genuinely brand-new venue, gets circuit_new_or_changed=True and NaN
+    history (no borrowing from the old layout's rows, or from any other
+    venue). circuit_new_or_changed is a property of the event itself (every
+    driver/team there faces the same blank slate), not of any one driver's
+    experience.
+    """
+    df = df.copy()
+    df["_hist_key"] = [_history_key(c, s) for c, s in zip(df["circuit_id"], df["season"])]
+
+    first_season = df.groupby("_hist_key")["season"].transform("min")
+    df["circuit_new_or_changed"] = df["season"] == first_season
+
+    def _circuit_history(entity_col: str, prefix: str, dedupe: bool = False) -> pd.DataFrame:
+        cols = [entity_col, "_hist_key", "season", "round", "quali_position", "target_finish_pos"]
+        d = df[cols].copy()
+        if dedupe:
+            # team_id has 2 rows per race (one per teammate) in df -- collapse
+            # to one row per (team, circuit identity, race) BEFORE rolling, or
+            # the later merge back onto df fans out 2x2 (confirmed live: every
+            # row in the dataset silently doubled without this).
+            d = d.groupby([entity_col, "_hist_key", "season", "round"], as_index=False).agg(
+                quali_position=("quali_position", "mean"), target_finish_pos=("target_finish_pos", "mean"))
+        d = d.sort_values([entity_col, "_hist_key", "season"])
+        grp = d.groupby([entity_col, "_hist_key"])
+        d[f"{prefix}_circuit_avg_quali_3"] = grp["quali_position"].transform(
+            lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        d[f"{prefix}_circuit_avg_finish_3"] = grp["target_finish_pos"].transform(
+            lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        d[f"{prefix}_circuit_races_here"] = grp.cumcount()  # count of PRIOR editions, 0 for the first
+        prior_min_season = grp["season"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).min())
+        d[f"{prefix}_circuit_hist_pre_reg_change"] = [
+            bool(pd.notna(pmin) and _reg_era(int(pmin)) < _reg_era(int(cur)))
+            for pmin, cur in zip(prior_min_season, d["season"])
+        ]
+        return d[[entity_col, "_hist_key", "season", "round",
+                 f"{prefix}_circuit_avg_quali_3", f"{prefix}_circuit_avg_finish_3",
+                 f"{prefix}_circuit_races_here", f"{prefix}_circuit_hist_pre_reg_change"]]
+
+    df = df.merge(_circuit_history("driver", "driver"), on=["driver", "_hist_key", "season", "round"], how="left")
+    df = df.merge(_circuit_history("team_id", "team", dedupe=True),
+                 on=["team_id", "_hist_key", "season", "round"], how="left")
+    df = df.drop(columns=["_hist_key"])
+
+    # --- rolling qualifying form (mirrors the finish-position rolling block) ---
+    df = df.sort_values(["driver", "season", "round"])
+    g = df.groupby("driver")
+    df["driver_rolling_quali_position_3"] = g["quali_position"].transform(lambda s: _rolling(s, 3))
+    df["driver_rolling_quali_position_5"] = g["quali_position"].transform(lambda s: _rolling(s, 5))
+    df["teammate_quali_gap_trend_3"] = g["teammate_quali_gap_s"].transform(lambda s: _rolling(s, 3))
+
+    team_quali = df.groupby(["season", "round", "team_id"], as_index=False).agg(
+        team_quali=("quali_position", "mean"))
+    team_quali = team_quali.sort_values(["team_id", "season", "round"])
+    team_quali["team_rolling_quali_position_3"] = team_quali.groupby("team_id")["team_quali"].transform(
+        lambda s: _rolling(s, 3))
+    df = df.merge(team_quali[["season", "round", "team_id", "team_rolling_quali_position_3"]],
+                 on=["season", "round", "team_id"], how="left")
+    return df
+
+
+# --------------------------------------------------------------------------
+# Practice pace (FP2+FP3, prebuilt laps-only -- see build_prebuilt.py's
+# LAPS_ONLY_SESSIONS). NaN wherever FP2/FP3 aren't prebuilt yet, or there
+# aren't enough laps to form a long-run estimate -- "when available" by
+# design, same pattern as team_rolling_pace_gap_3.
+# --------------------------------------------------------------------------
+
+def _fp_long_run_median(lap_times: pd.Series, min_laps: int = 6, drop_fastest: int = 3) -> float:
+    """A cheap long-run-pace proxy without full stint detection: drop each
+    driver's `drop_fastest` quickest laps (push/quali-sim laps, which don't
+    represent fuel-corrected race pace) and take the median of the rest.
+    NaN if there aren't enough laps to do that meaningfully."""
+    s = lap_times.sort_values()
+    if len(s) < min_laps:
+        return np.nan
+    rest = s.iloc[drop_fastest:]
+    return float(rest.median()) if len(rest) >= 3 else np.nan
+
+
+def _fp_pace_table(seasons: tuple[int, ...] = (2025, 2026)) -> pd.DataFrame:
+    """(season, round, driver) -> fp_best_gap_s (best single lap across
+    FP2+FP3, gap to the session's fastest driver) and fp_long_run_gap_s
+    (gap between each driver's _fp_long_run_median and the fastest one)."""
+    rows = []
+    for r in prebuilt_races():
+        if r["year"] not in seasons:
+            continue
+        frames = []
+        for code in ("FP2", "FP3"):
+            if code not in r["sessions"]:
+                continue
+            resolved = _resolve_prebuilt(r["year"], r["round"], code)
+            if resolved is None:
+                continue
+            s = PrebuiltSession(*resolved, code)
+            if s.laps.empty:
+                continue
+            laps = s.laps[s.laps["PitInTime"].isna() & s.laps["PitOutTime"].isna()].copy()
+            if "TrackStatus" in laps.columns:
+                laps = laps[laps["TrackStatus"] == "1"]
+            frames.append(laps)
+        if not frames:
+            continue
+        laps = pd.concat(frames, ignore_index=True).dropna(subset=["LapTime", "Driver"])
+        if laps.empty:
+            continue
+        laps["LapTimeS"] = laps["LapTime"].dt.total_seconds()
+
+        best = laps.groupby("Driver")["LapTimeS"].min()
+        if best.empty:
+            continue
+        best_gap = best - best.min()
+
+        long_run = laps.groupby("Driver")["LapTimeS"].apply(_fp_long_run_median)
+        valid = long_run.dropna()
+        long_run_gap = long_run - valid.min() if not valid.empty else long_run
+
+        for drv in best.index:
+            rows.append({"season": r["year"], "round": r["round"], "driver": drv,
+                        "fp_best_gap_s": float(best_gap.get(drv, np.nan)),
+                        "fp_long_run_gap_s": float(long_run_gap.get(drv, np.nan))})
+    return pd.DataFrame(rows, columns=["season", "round", "driver", "fp_best_gap_s", "fp_long_run_gap_s"])
+
+
 def collect_all(seasons_prebuilt: tuple[int, ...] = (2025, 2026),
                 seasons_ergast: tuple[int, ...] = (2022, 2023, 2024)) -> pd.DataFrame:
     crosswalk = _circuit_crosswalk(list(seasons_prebuilt) + list(seasons_ergast))
@@ -382,6 +551,11 @@ def build_dataset(seasons_prebuilt: tuple[int, ...] = (2025, 2026),
         print(f"! dropped {before - len(df)} rows with no classified finish position (DNS with no data)")
 
     df = add_delta_and_team_dnf_features(df)
+    df = add_circuit_history_and_quali_rolling_features(df)
+
+    fp_pace = _fp_pace_table(seasons_prebuilt)
+    df = df.merge(fp_pace, on=["season", "round", "driver"], how="left") if not fp_pace.empty \
+        else df.assign(fp_best_gap_s=np.nan, fp_long_run_gap_s=np.nan)
 
     return df.sort_values(["season", "round", "target_finish_pos"])[FINAL_COLUMNS].reset_index(drop=True)
 
