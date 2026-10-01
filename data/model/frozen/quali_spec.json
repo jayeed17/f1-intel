@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "frozen_at": "2026-10-01",
+  "dataset_sha256": "8f0e1dfca231eef5902c01ff2f70f4f533b47bd33189c56874c57ea8604f7b5e",
+  "n_rows": 2146,
+  "params": {
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 60,
+    "learning_rate": 0.05,
+    "max_iter": 500,
+    "l2_regularization": 1.0
+  },
+  "residual_std": 3.6761937276545815,
+  "notes": "Initial freeze: positions-gained-vs-rolling-quali-form regressor, single global MC noise, trained on full dataset. Baselines (rolling5, last-year-at-track): neither bootstrap CI vs baseline is significant on 2025-2026 holdout. See README for the full comparison."
+}
