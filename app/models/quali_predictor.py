@@ -179,12 +179,16 @@ def add_quali_target(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def simulate_quali_positions(baseline: pd.Series, delta_pred: pd.Series, residual_std: float,
-                             n_sims: int = 10_000, seed: int | None = None) -> dict[str, np.ndarray]:
+                             n_sims: int = 10_000, seed: int | None = None,
+                             return_ranks: bool = False) -> dict[str, np.ndarray]:
     """Each run: baseline + delta_pred + Normal(0, residual_std) noise,
     ranked within the run (argsort trick, same as race_predictor.py's
     simulate_positions) so every run is a valid unique 1..N qualifying
     order. P(Q3) = P(final position <= 10) -- F1's Q1/Q2/Q3 knockout
-    format cuts to the top 10 after Q2."""
+    format cuts to the top 10 after Q2. return_ranks=True additionally
+    returns the full (n_sims, n_drivers) rank matrix -- used by
+    race_predictor_v2.predict_race_v2() to sample a grid realization per
+    Monte Carlo run instead of collapsing to one point estimate first."""
     n = len(baseline)
     rng = np.random.default_rng(seed)
     base_a = baseline.to_numpy(dtype=float)
@@ -197,12 +201,15 @@ def simulate_quali_positions(baseline: pd.Series, delta_pred: pd.Series, residua
     rows = np.arange(n_sims)[:, None]
     ranks[rows, order] = np.arange(1, n + 1)[None, :]
 
-    return {
+    out = {
         "p_pole": (ranks == 1).mean(axis=0),
         "p_top3": (ranks <= 3).mean(axis=0),
         "p_q3": (ranks <= 10).mean(axis=0),
         "expected_position": ranks.mean(axis=0),
     }
+    if return_ranks:
+        out["ranks"] = ranks
+    return out
 
 
 # --------------------------------------------------------------------------

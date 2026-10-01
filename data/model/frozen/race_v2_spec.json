@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "frozen_at": "2026-10-01",
+  "dataset_sha256": "8f0e1dfca231eef5902c01ff2f70f4f533b47bd33189c56874c57ea8604f7b5e",
+  "n_rows": 2146,
+  "delta_params": {
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 30,
+    "learning_rate": 0.05,
+    "max_iter": 500,
+    "l2_regularization": 1.0
+  },
+  "dnf_params": {
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 60,
+    "learning_rate": 0.05,
+    "max_iter": 500,
+    "l2_regularization": 1.0
+  },
+  "residual_std": 3.2399,
+  "residual_std_by_bucket": {
+    "1-3": 3.6751,
+    "4-10": 3.0303,
+    "11+": 3.2278
+  },
+  "dnf_position_prior": 18.924812030075188,
+  "notes": "v1 features + circuit history (driver/team avg quali+finish at this circuit, last 3 editions; new/changed-circuit flag; reg-change-span flag). Grid-bucket MC noise + isotonic win/podium calibration, same as v1's refined version. No significant improvement over v1 or the grid baseline on the 2025-2026 holdout (bootstrap CIs); win Brier vs grid baseline is marginally significant in the unfavorable direction. See README for the full comparison."
+}
