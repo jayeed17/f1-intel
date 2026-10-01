@@ -66,13 +66,14 @@ class _Fastf1WarningCapture(logging.Handler):
             self.messages.append(msg)
 
 
-def _load_with_diagnosis(year: int, gp: str, round_number: int, session: str):
+def _load_with_diagnosis(year: int, gp: str, round_number: int, session: str, telemetry: bool = True):
     """Load a session, classifying *why* it failed instead of guessing.
 
     Returns (session_obj, None) on success, or (None, (category, detail)) on
     failure where category is "rate_limited", "download_failed", or
     "not_published". Retries with backoff on a hard rate limit rather than
-    giving up immediately.
+    giving up immediately. telemetry=False skips FastF1's car-data load too
+    (laps-only sessions -- see build_session()'s laps_only).
     """
     capture = _Fastf1WarningCapture()
     fastf1_logger = logging.getLogger("fastf1")
@@ -82,7 +83,7 @@ def _load_with_diagnosis(year: int, gp: str, round_number: int, session: str):
         while True:
             capture.messages.clear()
             try:
-                return load_session(year, round_number, session, telemetry=True), None
+                return load_session(year, round_number, session, telemetry=telemetry), None
             except RateLimitExceededError as e:
                 if attempt >= len(_RATE_LIMIT_BACKOFFS):
                     return None, ("rate_limited", f"gave up after {attempt} retries: {e}")
@@ -155,15 +156,23 @@ def _is_missing_or_partial(session_code: str, existing: dict) -> bool:
     return existing.get("session_status", {}).get(session_code, {}).get("status") == "partial"
 
 
-def build_session(year: int, gp: str, round_number: int,
-                  session: str) -> tuple[int, str, list[str]] | tuple[None, None, None]:
+def build_session(year: int, gp: str, round_number: int, session: str,
+                  laps_only: bool = False) -> tuple[int, str, list[str]] | tuple[None, None, None]:
     """Build one session's parquet files. Returns (driver count, source
     ("fastf1" or "openf1"), missing) on success -- missing is [] for a fully
     complete build, or e.g. ["telemetry", "corners"] for a partial one (see
     _classify_missing). Returns (None, None, None) if the session couldn't be
-    loaded from either source at all (skipped, not fatal)."""
+    loaded from either source at all (skipped, not fatal).
+
+    laps_only (used for FP1-3, see main()'s LAPS_ONLY_SESSIONS): skips
+    FastF1's own telemetry load, the corner map, and the per-driver
+    telemetry extraction entirely -- just laps.parquet + results.parquet,
+    to keep three extra sessions per race weekend from blowing up the
+    bundle size. corners.parquet is still written empty so PrebuiltSession
+    stays a uniform shape regardless of session type.
+    """
     out_dir = PREBUILT_DIR / str(year) / str(round_number) / session
-    s, failure = _load_with_diagnosis(year, gp, round_number, session)
+    s, failure = _load_with_diagnosis(year, gp, round_number, session, telemetry=not laps_only)
     source = "fastf1"
     if failure is not None:
         category, detail = failure
@@ -189,6 +198,14 @@ def build_session(year: int, gp: str, round_number: int,
         print(f"  ! {gp} {session}: no results ({e})")
         results = pd.DataFrame(columns=RESULTS_COLUMNS)
     results.to_parquet(out_dir / "results.parquet")
+
+    if laps_only:
+        pd.DataFrame(columns=["Label", "Number", "Distance", "X", "Y", "Estimated"]).to_parquet(
+            out_dir / "corners.parquet")
+        (out_dir / "telemetry").mkdir(exist_ok=True)
+        driver_count = laps["Driver"].dropna().nunique() if not laps.empty else 0
+        print(f"  {gp} {session} [{source}, laps-only]: laps={len(laps)} results={len(results)}")
+        return driver_count, source, []
 
     try:
         cn = compute_corners(s)
@@ -261,11 +278,14 @@ def missing_completed_sessions(manifest: dict[tuple[int, str], dict], years: lis
     return missing
 
 
+LAPS_ONLY_SESSIONS = {"FP1", "FP2", "FP3"}
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--year", type=int, action="append", required=True)
     p.add_argument("--race", default=None, help="Only build this event name (substring match)")
-    p.add_argument("--sessions", default="Q,R,S,SQ")
+    p.add_argument("--sessions", default="FP1,FP2,FP3,Q,R,S,SQ")
     p.add_argument("--only-missing", action="store_true",
                    help="Skip races/sessions already present in the manifest")
     p.add_argument("--force", action="store_true",
@@ -308,7 +328,8 @@ def main() -> None:
             print(f"{year} {gp} (round {round_number}): building {to_build}")
             built_now = []
             for session in to_build:
-                written, source, missing = build_session(year, gp, round_number, session)
+                written, source, missing = build_session(year, gp, round_number, session,
+                                                         laps_only=session in LAPS_ONLY_SESSIONS)
                 if written is not None:
                     built_now.append(session)
                     existing["session_status"][session] = {

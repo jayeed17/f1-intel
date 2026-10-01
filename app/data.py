@@ -94,12 +94,23 @@ def prebuilt_built_at(year: int, gp: str) -> str | None:
     return None
 
 
+# Practice sessions are built laps-only by design (build_prebuilt.py's
+# LAPS_ONLY_SESSIONS) -- never a "degraded source" situation, so the
+# manifest itself marks them "complete" (no retry needed), but every
+# telemetry-dependent consumer still needs to know there's no telemetry.
+_LAPS_ONLY_SESSIONS = {"FP1", "FP2", "FP3"}
+
+
 def session_missing(year: int, gp: str, session: str) -> list[str]:
     """What a prebuilt session is still missing per the manifest's
     session_status (e.g. ["telemetry", "corners"] for a session that could
     only be built from a degraded source, like OpenF1 without car data).
     Empty for a complete session, one not in the manifest, or an older
-    manifest entry predating this field."""
+    manifest entry predating this field. Always non-empty for FP1-3,
+    regardless of manifest status -- they're laps-only on purpose, not
+    degraded."""
+    if session in _LAPS_ONLY_SESSIONS:
+        return ["telemetry", "corners"]
     for r in _prebuilt_manifest():
         if r["year"] == year and r["name"].lower() == str(gp).lower():
             return r.get("session_status", {}).get(session, {}).get("missing", [])
