@@ -20,15 +20,21 @@ from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
 from app.analysis.team_report import team_report  # noqa: E402
 from app.config import RACE_DATASET_PATH  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
-                      get_lap, get_session, has_position_data, lap_telemetry,
+                      forecast_features, get_lap, get_session, has_position_data, lap_telemetry,
                       load_session, prebuilt_built_at, prebuilt_races, race_laps,
-                      race_prediction_features, session_missing)
+                      race_prediction_features, race_stage_for, session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.race_predictor import DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS  # noqa: E402
 from app.models.race_predictor import FEATURES_DELTA, FEATURES_DNF, TARGET_DELTA, TARGET_DNF  # noqa: E402
 from app.models.race_predictor import _prep_delta, _prep_dnf  # noqa: E402
 from app.models.race_predictor import ensure_trained, predict_race, run_full_evaluation  # noqa: E402
 from app.models.race_predictor import compute_live_track_record, frozen_model_spec  # noqa: E402
+from app.models.quali_predictor import ensure_trained as ensure_trained_quali  # noqa: E402
+from app.models.quali_predictor import predict_quali  # noqa: E402
+from app.models.quali_predictor import frozen_model_spec as frozen_quali_spec  # noqa: E402
+from app.models.race_predictor_v2 import ensure_trained as ensure_trained_race_v2  # noqa: E402
+from app.models.race_predictor_v2 import predict_race_v2  # noqa: E402
+from app.models.race_predictor_v2 import frozen_model_spec as frozen_race_v2_spec  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
@@ -38,7 +44,7 @@ COMPOUND_COLORS = {"SOFT": "#E8002D", "MEDIUM": "#FFD12E", "HARD": "#F0F0EC"}
 # These three need per-lap car telemetry (heavy); the rest only need lap timing.
 TELEMETRY_VIEWS = ["Braking", "Head to head", "Track dominance"]
 PARQUET_VIEWS = ["Tyre degradation", "Strategy", "Team report"]
-PREDICTOR_VIEWS = ["Race predictor"]
+PREDICTOR_VIEWS = ["Predictions"]
 _SESSION_ORDER = ["FP1", "FP2", "FP3", "SQ", "S", "Q", "R"]
 
 
@@ -95,6 +101,72 @@ def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
     return labels, mapping
 
 
+def _predictions_race_options() -> tuple[list[str], dict[str, dict]]:
+    """2026 race dropdown, oldest round first: every prebuilt 2026 race,
+    plus -- best effort -- the next round not in the manifest yet, so a
+    genuine pre-weekend "Forecast" entry can show up. The schedule lookup
+    is wrapped in its own try/except and silently skipped if it fails
+    (e.g. on Streamlit Cloud, which can't reach FastF1 at all) so the rest
+    of the dropdown still works from the prebuilt bundle alone."""
+    races = sorted((r for r in prebuilt_races() if r["year"] == 2026), key=lambda r: r["round"])
+    options = {f"{r['name']} {r['year']}": {"year": r["year"], "name": r["name"], "round": r["round"]}
+              for r in races}
+    built_rounds = {r["round"] for r in races}
+    try:
+        sch = fastf1.get_event_schedule(2026, include_testing=False)
+        upcoming = sch[~sch["RoundNumber"].isin(built_rounds)].sort_values("RoundNumber")
+        if not upcoming.empty:
+            nxt = upcoming.iloc[0]
+            options[f"{nxt['EventName']} 2026"] = {"year": 2026, "name": nxt["EventName"],
+                                                   "round": int(nxt["RoundNumber"])}
+    except Exception:
+        pass
+    return list(options.keys()), options
+
+
+def _default_predictions_index(options: dict[str, dict]) -> int:
+    """The next race whose result isn't in yet, or the most recent one if
+    the whole season (so far) is already classified."""
+    labels = list(options.keys())
+    for i, label in enumerate(labels):
+        info = options[label]
+        if race_stage_for(info["year"], info["name"]) != "Result":
+            return i
+    return max(len(labels) - 1, 0)
+
+
+@st.cache_resource(show_spinner="Training qualifying predictor...")
+def cached_quali_models():
+    return ensure_trained_quali(RACE_DATASET_PATH)
+
+
+@st.cache_resource(show_spinner="Training race predictor v2...")
+def cached_race_v2_models():
+    return ensure_trained_race_v2(RACE_DATASET_PATH)
+
+
+def _track_history_table(race_feats: pd.DataFrame) -> pd.DataFrame:
+    """Each driver's and their team's history at this circuit (last up to 3
+    prior editions), already computed with a correct season cutoff by
+    app.data's feature-assembly functions -- just reshaped for display.
+    Empty if nobody has prior editions here (new or layout-changed venue)."""
+    if race_feats.empty or not (race_feats["driver_circuit_races_here"].fillna(0) > 0).any():
+        return pd.DataFrame()
+    cols = ["driver", "team_id", "driver_circuit_avg_quali_3", "driver_circuit_avg_finish_3",
+           "driver_circuit_races_here", "team_circuit_avg_quali_3", "team_circuit_avg_finish_3",
+           "team_circuit_races_here"]
+    hist = race_feats[cols].rename(columns={
+        "driver": "Driver", "team_id": "Team",
+        "driver_circuit_avg_quali_3": "Driver avg quali (last 3)",
+        "driver_circuit_avg_finish_3": "Driver avg finish (last 3)",
+        "driver_circuit_races_here": "Driver races here",
+        "team_circuit_avg_quali_3": "Team avg quali (last 3)",
+        "team_circuit_avg_finish_3": "Team avg finish (last 3)",
+        "team_circuit_races_here": "Team races here",
+    })
+    return hist.sort_values("Driver races here", ascending=False)
+
+
 with st.sidebar:
     race_labels, race_map = _race_options()
     if not race_labels:
@@ -108,7 +180,7 @@ with st.sidebar:
         kind = st.selectbox("Session", _SESSION_ORDER, index=_SESSION_ORDER.index("Q"))
     elif view in PREDICTOR_VIEWS:
         kind = "Q"
-        st.caption("Predicts from this race's Qualifying results.")
+        st.caption("Has its own 2026 race picker below -- the sidebar race selection doesn't apply here.")
     else:
         kind = "R"
         st.caption("Uses Race session data.")
@@ -260,108 +332,173 @@ def render_view() -> None:
         fig.update_layout(height=420, yaxis_title="gap to best sector (s)")
         st.plotly_chart(fig, width="stretch")
 
-    elif view == "Race predictor":
+    elif view == "Predictions":
         if not RACE_DATASET_PATH.exists():
             st.warning("Race dataset not built yet -- run `python -m scripts.build_race_dataset`.")
             return
-        delta_pipe, dnf_pipe, meta = cached_predictor_models()
+
+        labels, options = _predictions_race_options()
+        if not labels:
+            st.warning("No 2026 race data available yet.")
+            return
+        pred_label = st.selectbox("2026 race", labels, index=_default_predictions_index(options),
+                                  key="predictions_race")
+        race_info = options[pred_label]
+        pred_year, pred_gp, pred_round = race_info["year"], race_info["name"], race_info["round"]
+
+        stage = race_stage_for(pred_year, pred_gp)
+        badge = {"Forecast": "🔵 Forecast", "Post-practice": "🟡 Post-practice",
+                "Post-quali": "🟠 Post-quali", "Result": "🟢 Result"}[stage]
+        st.markdown(f"### {pred_gp} {pred_year} -- {badge}")
+
+        dataset = pd.read_parquet(RACE_DATASET_PATH)
+        circuit_row = dataset[(dataset["season"] == pred_year) & (dataset["round"] == pred_round)]
+        circuit_id = circuit_row["circuit_id"].iloc[0] if not circuit_row.empty else None
+
         try:
-            features = race_prediction_features(int(year), gp)
+            race_feats = (forecast_features(pred_year, circuit_id) if stage in ("Forecast", "Post-practice")
+                         else race_prediction_features(pred_year, pred_gp, circuit_id))
         except Exception as e:
-            st.error(f"Could not load qualifying for this race: {e}")
+            st.error(f"Could not load data for this race: {e}")
             return
 
-        preds = predict_race(delta_pipe, dnf_pipe, features, meta)
-        st.caption("Predicted from this race's qualifying results, as if predicting before the race "
-                  "(grid assumed = qualifying classification). Positions-gained model + DNF model, "
-                  "combined via a 10k-run Monte Carlo simulation -- see the holdout track record "
-                  "below for how this actually compares to the grid/quali baselines on 2025-2026.")
-        show = preds[["predicted_position", "driver", "team_id", "grid",
-                     "win_probability", "podium_probability", "points_probability"]].copy()
-        for c in ("win_probability", "podium_probability", "points_probability"):
-            show[c] = show[c] * 100
-        show = show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
-                                    "team_id": "Team", "grid": "Grid (quali)",
-                                    "win_probability": "P(win)", "podium_probability": "P(podium)",
-                                    "points_probability": "P(points)"})
-        st.dataframe(show, width="stretch", hide_index=True,
-                    column_config={c: st.column_config.NumberColumn(format="%.1f%%")
-                                  for c in ("P(win)", "P(podium)", "P(points)")})
+        quali_pipe, quali_meta = cached_quali_models()
+        quali_preds = predict_quali(quali_pipe, race_feats, quali_meta)
 
-        st.subheader("Feature importance (permutation, full dataset)")
-        imp_delta, imp_dnf = cached_feature_importance(delta_pipe, dnf_pipe)
+        race_delta_pipe, race_dnf_pipe, race_meta = cached_race_v2_models()
+        if stage in ("Forecast", "Post-practice"):
+            race_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta,
+                                        quali_pipe=quali_pipe, quali_meta=quali_meta, quali_features=race_feats)
+            st.caption("Grid not known yet -- each of the race model's 10k Monte Carlo runs samples its own "
+                      "simulated qualifying order from the quali model, instead of using one fixed projection.")
+        else:
+            race_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta)
+
         col1, col2 = st.columns(2)
         with col1:
-            st.caption("Positions-gained (delta) model -- MAE increase when shuffled")
-            fig = px.bar(imp_delta, x="importance", y="feature", orientation="h", template=TEMPLATE)
-            fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
-            st.plotly_chart(fig, width="stretch")
+            st.markdown("**Qualifying**")
+            q_show = quali_preds[["predicted_quali_position", "driver", "team_id", "pole_probability",
+                                  "top3_probability", "q3_probability", "expected_quali_position"]].copy()
+            for c in ("pole_probability", "top3_probability", "q3_probability"):
+                q_show[c] = q_show[c] * 100
+            q_show = q_show.rename(columns={"predicted_quali_position": "Predicted", "driver": "Driver",
+                                            "team_id": "Team", "pole_probability": "P(pole)",
+                                            "top3_probability": "P(top 3)", "q3_probability": "P(Q3)",
+                                            "expected_quali_position": "Expected pos."})
+            st.dataframe(q_show, width="stretch", hide_index=True,
+                        column_config={c: st.column_config.NumberColumn(format="%.1f%%")
+                                      for c in ("P(pole)", "P(top 3)", "P(Q3)")})
         with col2:
-            st.caption("DNF model -- log-loss increase when shuffled")
-            fig = px.bar(imp_dnf, x="importance", y="feature", orientation="h", template=TEMPLATE)
-            fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
-            st.plotly_chart(fig, width="stretch")
+            st.markdown("**Race**")
+            r_show = race_preds[["predicted_position", "driver", "team_id", "win_probability",
+                                 "podium_probability", "points_probability"]].copy()
+            for c in ("win_probability", "podium_probability", "points_probability"):
+                r_show[c] = r_show[c] * 100
+            r_show = r_show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
+                                            "team_id": "Team", "win_probability": "P(win)",
+                                            "podium_probability": "P(podium)",
+                                            "points_probability": "P(points)"})
+            st.dataframe(r_show, width="stretch", hide_index=True,
+                        column_config={c: st.column_config.NumberColumn(format="%.1f%%")
+                                      for c in ("P(win)", "P(podium)", "P(points)")})
 
-        report = cached_predictor_report()
-
-        st.subheader("Season track record: model vs grid baseline (position MAE)")
-        rows = [{"season": season, "method": method,
-                "position_mae": m.get("point_metrics", {}).get(method, {}).get("position_mae")}
-               for season, m in report.get("by_season", {}).items() for method in ("model", "baseline_grid")]
-        record = pd.DataFrame(rows).dropna(subset=["position_mae"])
-        fig = px.bar(record, x="season", y="position_mae", color="method", barmode="group", template=TEMPLATE)
-        fig.update_layout(height=380, yaxis_title="position MAE (lower is better)")
-        st.plotly_chart(fig, width="stretch")
-
-        st.subheader("Holdout (2025-2026) calibration: predicted P(points) vs observed frequency")
-        cal = report.get("holdout", {}).get("calibration", {}).get("points")
-        if cal:
-            cal_df = pd.DataFrame(cal)
-            fig = px.line(cal_df, x="predicted", y="observed", markers=True, template=TEMPLATE)
-            fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1,
-                         line=dict(dash="dash", color="gray"))
-            fig.update_layout(height=380, xaxis_title="predicted P(points)",
-                             yaxis_title="observed frequency", xaxis_range=[0, 1], yaxis_range=[0, 1])
-            st.plotly_chart(fig, width="stretch")
+        st.subheader("Track history")
+        hist = _track_history_table(race_feats)
+        if hist.empty:
+            st.caption("No prior editions of this circuit in the dataset (new or recently changed venue).")
         else:
-            st.caption("Not enough holdout rows yet for a calibration curve.")
+            st.dataframe(hist, width="stretch", hide_index=True)
 
-        holdout_model = report.get("holdout", {}).get("point_metrics", {}).get("model", {})
-        holdout_grid = report.get("holdout", {}).get("point_metrics", {}).get("baseline_grid", {})
-        if holdout_model and holdout_grid:
-            st.caption(f"Holdout (2025-2026, {report['holdout']['n_races']} races): model position MAE "
-                      f"{holdout_model['position_mae']} vs grid baseline {holdout_grid['position_mae']} -- "
-                      "see the README's \"Race outcome predictor\" section for the full honest comparison "
-                      "(point + probabilistic metrics) against both baselines.")
+        if stage == "Result":
+            st.subheader("Predicted vs actual")
+            actual = circuit_row[["driver", "quali_position", "target_finish_pos"]].rename(
+                columns={"quali_position": "Actual quali", "target_finish_pos": "Actual finish"})
+            pred_vs_actual = quali_preds[["driver", "predicted_quali_position"]].rename(
+                columns={"predicted_quali_position": "Predicted quali"})
+            pred_vs_actual = pred_vs_actual.merge(
+                race_preds[["driver", "predicted_position"]].rename(
+                    columns={"predicted_position": "Predicted finish"}), on="driver")
+            pred_vs_actual = pred_vs_actual.merge(actual, on="driver").sort_values("Actual finish")
+            st.dataframe(pred_vs_actual[["driver", "Predicted quali", "Actual quali",
+                                        "Predicted finish", "Actual finish"]],
+                        width="stretch", hide_index=True)
 
-        spec = frozen_model_spec()
-        if spec:
-            frozen_at = spec["frozen_at"]
-            st.subheader(f"Live track record since {frozen_at}")
-            st.caption(f"Model v{spec['version']}, frozen {frozen_at} -- no further tuning since. "
-                      "Only predictions logged at or after this date count, so this is a genuinely "
-                      "prospective test, not another look at CV data.")
-            live = compute_live_track_record(frozen_at)
-            if live is None:
-                st.info("No races predicted since the freeze yet -- this fills in as the weekly "
-                       "Action logs and scores predictions going forward.")
-            elif live["n_races_scored"] == 0:
-                st.info(f"{live['n_races_predicted']} race(s) predicted since the freeze, "
-                       "none scored yet (race hasn't happened / results not in yet).")
+        with st.expander("Race v1 model diagnostics (feature importance, track record, calibration)"):
+            delta_pipe, dnf_pipe, _meta = cached_predictor_models()
+            st.caption("Feature importance (permutation, full dataset)")
+            imp_delta, imp_dnf = cached_feature_importance(delta_pipe, dnf_pipe)
+            ecol1, ecol2 = st.columns(2)
+            with ecol1:
+                st.caption("Positions-gained (delta) model -- MAE increase when shuffled")
+                fig = px.bar(imp_delta, x="importance", y="feature", orientation="h", template=TEMPLATE)
+                fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
+                st.plotly_chart(fig, width="stretch")
+            with ecol2:
+                st.caption("DNF model -- log-loss increase when shuffled")
+                fig = px.bar(imp_dnf, x="importance", y="feature", orientation="h", template=TEMPLATE)
+                fig.update_layout(height=350, xaxis_title="importance", yaxis_title="")
+                st.plotly_chart(fig, width="stretch")
+
+            report = cached_predictor_report()
+
+            st.subheader("Season track record: model vs grid baseline (position MAE)")
+            rows = [{"season": season, "method": method,
+                    "position_mae": m.get("point_metrics", {}).get(method, {}).get("position_mae")}
+                   for season, m in report.get("by_season", {}).items() for method in ("model", "baseline_grid")]
+            record = pd.DataFrame(rows).dropna(subset=["position_mae"])
+            fig = px.bar(record, x="season", y="position_mae", color="method", barmode="group", template=TEMPLATE)
+            fig.update_layout(height=380, yaxis_title="position MAE (lower is better)")
+            st.plotly_chart(fig, width="stretch")
+
+            st.subheader("Holdout (2025-2026) calibration: predicted P(points) vs observed frequency")
+            cal = report.get("holdout", {}).get("calibration", {}).get("points")
+            if cal:
+                cal_df = pd.DataFrame(cal)
+                fig = px.line(cal_df, x="predicted", y="observed", markers=True, template=TEMPLATE)
+                fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1,
+                             line=dict(dash="dash", color="gray"))
+                fig.update_layout(height=380, xaxis_title="predicted P(points)",
+                                 yaxis_title="observed frequency", xaxis_range=[0, 1], yaxis_range=[0, 1])
+                st.plotly_chart(fig, width="stretch")
             else:
-                cols = st.columns(4)
-                cols[0].metric("Races scored", live["n_races_scored"])
-                cols[1].metric("Model MAE", live["model_mae"], delta=round(live["model_mae"] - live["grid_mae"], 3),
-                              delta_color="inverse")
-                cols[2].metric("Grid MAE", live["grid_mae"])
-                if live.get("model_winner_accuracy") is not None:
-                    cols[3].metric("Winner accuracy", f"{live['model_winner_accuracy']:.0%}")
-                brier_bits = [f"win {live['win_brier']}" if "win_brier" in live else None,
-                            f"podium {live['podium_brier']}" if "podium_brier" in live else None,
-                            f"points {live['points_brier']}" if "points_brier" in live else None]
-                brier_bits = [b for b in brier_bits if b]
-                if brier_bits:
-                    st.caption("Brier (lower is better): " + ", ".join(brier_bits))
+                st.caption("Not enough holdout rows yet for a calibration curve.")
+
+            holdout_model = report.get("holdout", {}).get("point_metrics", {}).get("model", {})
+            holdout_grid = report.get("holdout", {}).get("point_metrics", {}).get("baseline_grid", {})
+            if holdout_model and holdout_grid:
+                st.caption(f"Holdout (2025-2026, {report['holdout']['n_races']} races): model position MAE "
+                          f"{holdout_model['position_mae']} vs grid baseline {holdout_grid['position_mae']} -- "
+                          "see the README's \"Race outcome predictor\" section for the full honest comparison "
+                          "(point + probabilistic metrics) against both baselines.")
+
+            spec = frozen_model_spec()
+            if spec:
+                frozen_at = spec["frozen_at"]
+                st.subheader(f"Live track record since {frozen_at}")
+                st.caption(f"Model v{spec['version']}, frozen {frozen_at} -- no further tuning since. "
+                          "Only predictions logged at or after this date count, so this is a genuinely "
+                          "prospective test, not another look at CV data.")
+                live = compute_live_track_record(frozen_at)
+                if live is None:
+                    st.info("No races predicted since the freeze yet -- this fills in as the weekly "
+                           "Action logs and scores predictions going forward.")
+                elif live["n_races_scored"] == 0:
+                    st.info(f"{live['n_races_predicted']} race(s) predicted since the freeze, "
+                           "none scored yet (race hasn't happened / results not in yet).")
+                else:
+                    lcols = st.columns(4)
+                    lcols[0].metric("Races scored", live["n_races_scored"])
+                    lcols[1].metric("Model MAE", live["model_mae"],
+                                   delta=round(live["model_mae"] - live["grid_mae"], 3), delta_color="inverse")
+                    lcols[2].metric("Grid MAE", live["grid_mae"])
+                    if live.get("model_winner_accuracy") is not None:
+                        lcols[3].metric("Winner accuracy", f"{live['model_winner_accuracy']:.0%}")
+                    brier_bits = [f"win {live['win_brier']}" if "win_brier" in live else None,
+                                f"podium {live['podium_brier']}" if "podium_brier" in live else None,
+                                f"points {live['points_brier']}" if "points_brier" in live else None]
+                    brier_bits = [b for b in brier_bits if b]
+                    if brier_bits:
+                        st.caption("Brier (lower is better): " + ", ".join(brier_bits))
 
 
 try:

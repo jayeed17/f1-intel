@@ -14,7 +14,7 @@ import requests
 from fastf1.exceptions import DataNotLoadedError
 from scipy.signal import find_peaks
 
-from app.config import (CACHE_DIR, CIRCUIT_TYPE, PREBUILT_DIR, PROCESSED_DIR,
+from app.config import (CACHE_DIR, CIRCUIT_HISTORY_RESET, CIRCUIT_TYPE, PREBUILT_DIR, PROCESSED_DIR,
                         RACE_DATASET_PATH, REG_CHANGE_SEASONS, TEAM_ID)
 
 
@@ -775,20 +775,134 @@ def _rolling_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, team_id
     }
 
 
+def _circuit_history_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, team_id: str,
+                                             circuit_id: str | None, season: int) -> dict:
+    """Driver/team circuit-history features for a LIVE upcoming event,
+    mirroring scripts/build_race_dataset.py's add_circuit_history_and_
+    quali_rolling_features() logic closely enough for prediction purposes
+    (last up to 3 prior editions at this circuit_id, strictly before
+    `season`). Honors CIRCUIT_HISTORY_RESET the same way: editions before a
+    layout-change season don't count. circuit_id=None (can't be resolved)
+    or no prior editions at all -> NaN history + circuit_new_or_changed."""
+    if circuit_id is None:
+        return {"driver_circuit_avg_quali_3": np.nan, "driver_circuit_avg_finish_3": np.nan,
+                "driver_circuit_last_quali": np.nan, "driver_circuit_races_here": 0,
+                "team_circuit_avg_quali_3": np.nan, "team_circuit_avg_finish_3": np.nan,
+                "team_circuit_last_quali": np.nan, "team_circuit_races_here": 0,
+                "circuit_new_or_changed": True, "driver_circuit_hist_pre_reg_change": False,
+                "team_circuit_hist_pre_reg_change": False}
+
+    reset_season = CIRCUIT_HISTORY_RESET.get(circuit_id)
+    min_season = reset_season if (reset_season is not None and season >= reset_season) else -1
+
+    dh = dataset[(dataset["driver"] == driver) & (dataset["circuit_id"] == circuit_id)
+               & (dataset["season"] < season) & (dataset["season"] >= min_season)].sort_values(["season", "round"])
+    th_raw = dataset[(dataset["team_id"] == team_id) & (dataset["circuit_id"] == circuit_id)
+                    & (dataset["season"] < season) & (dataset["season"] >= min_season)]
+    th = th_raw.groupby(["season", "round"]).agg(
+        quali=("quali_position", "mean"), finish=("target_finish_pos", "mean")).sort_index()
+
+    all_prior_at_circuit = dataset[(dataset["circuit_id"] == circuit_id) & (dataset["season"] < season)
+                                  & (dataset["season"] >= min_season)]
+
+    return {
+        "driver_circuit_avg_quali_3": dh["quali_position"].tail(3).mean() if not dh.empty else np.nan,
+        "driver_circuit_avg_finish_3": dh["target_finish_pos"].tail(3).mean() if not dh.empty else np.nan,
+        "driver_circuit_last_quali": dh["quali_position"].iloc[-1] if not dh.empty else np.nan,
+        "driver_circuit_races_here": int(len(dh)),
+        "team_circuit_avg_quali_3": th["quali"].tail(3).mean() if not th.empty else np.nan,
+        "team_circuit_avg_finish_3": th["finish"].tail(3).mean() if not th.empty else np.nan,
+        "team_circuit_last_quali": th["quali"].iloc[-1] if not th.empty else np.nan,
+        "team_circuit_races_here": int(len(th)),
+        "circuit_new_or_changed": all_prior_at_circuit.empty,
+        "driver_circuit_hist_pre_reg_change": False,  # not reconstructed for live snapshots; a minor approximation
+        "team_circuit_hist_pre_reg_change": False,
+    }
+
+
+def _quali_rolling_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, team_id: str) -> dict:
+    """driver/team rolling QUALIFYING form (distinct from
+    _rolling_snapshot_for_prediction's race-finish rolling features) --
+    needed by app.models.quali_predictor and race_predictor_v2."""
+    dh = dataset[dataset["driver"] == driver].sort_values(["season", "round"])
+    th = dataset[dataset["team_id"] == team_id].groupby(["season", "round"]).agg(
+        quali=("quali_position", "mean")).sort_index()
+    return {
+        "driver_rolling_quali_position_3": dh["quali_position"].tail(3).mean() if not dh.empty else np.nan,
+        "driver_rolling_quali_position_5": dh["quali_position"].tail(5).mean() if not dh.empty else np.nan,
+        "team_rolling_quali_position_3": th["quali"].tail(3).mean() if not th.empty else np.nan,
+        "teammate_quali_gap_trend_3": dh["teammate_quali_gap_s"].tail(3).mean() if not dh.empty else np.nan,
+    }
+
+
 def race_prediction_features(year: int, gp: str, circuit_id: str | None = None) -> pd.DataFrame:
     """Pre-race feature row per driver for an upcoming race's qualifying
-    session, in the same shape app.models.race_predictor was trained on.
-    Used by scripts/predict_next_race.py and the /predict/race API route.
+    session (post-qualifying: grid/quali_position are real), in the shape
+    app.models.race_predictor / race_predictor_v2 / quali_predictor were
+    trained on (quali_predictor doesn't need grid, but ignores the extra
+    column harmlessly). Used by scripts/predict_next_race.py and the
+    /predict/race API route.
     """
     s = get_session(year, gp, "Q", telemetry=False)
     df = _quali_features_for_prediction(s)
     dataset = pd.read_parquet(RACE_DATASET_PATH)
     snaps = df.apply(lambda r: _rolling_snapshot_for_prediction(dataset, r["driver"], r["team_id"]),
                      axis=1, result_type="expand")
-    df = pd.concat([df, snaps], axis=1)
+    quali_snaps = df.apply(lambda r: _quali_rolling_snapshot_for_prediction(dataset, r["driver"], r["team_id"]),
+                          axis=1, result_type="expand")
+    hist_snaps = df.apply(lambda r: _circuit_history_snapshot_for_prediction(
+        dataset, r["driver"], r["team_id"], circuit_id, year), axis=1, result_type="expand")
+    df = pd.concat([df, snaps, quali_snaps, hist_snaps], axis=1)
     df["circuit_type"] = CIRCUIT_TYPE.get(circuit_id, "mixed")
     df["reg_change_flag"] = year in REG_CHANGE_SEASONS
+    # fp_best_gap_s/fp_long_run_gap_s aren't computed live (no network session
+    # loop over FP2/FP3 here) -- NaN, same "when available" semantics as the
+    # dataset itself; HistGradientBoosting handles it natively.
+    df["fp_best_gap_s"] = np.nan
+    df["fp_long_run_gap_s"] = np.nan
     return df
+
+
+def forecast_features(year: int, circuit_id: str | None = None) -> pd.DataFrame:
+    """Pre-WEEKEND feature row per driver -- no live session needed at all
+    (the "Forecast" dashboard stage, before FP1 has even happened). Roster
+    (who's racing, for which team) is approximated as "whoever was on the
+    grid last race", since there's no session to read an entry list from
+    yet. grid/quali_position are NaN -- genuinely unknown pre-weekend.
+    """
+    dataset = pd.read_parquet(RACE_DATASET_PATH)
+    latest_season_round = dataset[["season", "round"]].drop_duplicates().sort_values(["season", "round"]).iloc[-1]
+    roster = dataset[(dataset["season"] == latest_season_round["season"])
+                    & (dataset["round"] == latest_season_round["round"])][["driver", "team_id"]].drop_duplicates()
+
+    rows = []
+    for _, r in roster.iterrows():
+        row = {"driver": r["driver"], "team_id": r["team_id"], "grid": np.nan, "quali_position": np.nan,
+              "quali_gap_to_pole_s": np.nan, "teammate_quali_gap_s": np.nan, "grid_pit_lane": False}
+        row.update(_rolling_snapshot_for_prediction(dataset, r["driver"], r["team_id"]))
+        row.update(_quali_rolling_snapshot_for_prediction(dataset, r["driver"], r["team_id"]))
+        row.update(_circuit_history_snapshot_for_prediction(dataset, r["driver"], r["team_id"], circuit_id, year))
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df["circuit_type"] = CIRCUIT_TYPE.get(circuit_id, "mixed")
+    df["reg_change_flag"] = year in REG_CHANGE_SEASONS
+    df["fp_best_gap_s"] = np.nan
+    df["fp_long_run_gap_s"] = np.nan
+    return df
+
+
+def race_stage_for(year: int, gp: str) -> str:
+    """"Forecast" (nothing built yet), "Post-practice" (FP2/FP3 laps in),
+    "Post-quali" (grid known), or "Result" (race classified) -- the
+    dashboard's Predictions view badge."""
+    sessions = prebuilt_sessions_for(year, gp)
+    if "R" in sessions:
+        return "Result"
+    if "Q" in sessions:
+        return "Post-quali"
+    if "FP2" in sessions or "FP3" in sessions:
+        return "Post-practice"
+    return "Forecast"
 
 
 def to_records(df: pd.DataFrame) -> list[dict]:
