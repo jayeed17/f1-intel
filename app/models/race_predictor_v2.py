@@ -48,7 +48,7 @@ from sklearn.metrics import brier_score_loss, mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-from app.config import FROZEN_MODEL_DIR, MODEL_DIR
+from app.config import FROZEN_MODEL_DIR, MODEL_DIR, PREDICTIONS_DIR
 from app.models import race_predictor as v1
 
 # --------------------------------------------------------------------------
@@ -657,3 +657,71 @@ def predict_race_v2(delta_pipe, dnf_pipe, race_features: pd.DataFrame, meta: dic
     out["expected_position"] = sim["expected_position"]
     out = rank_within_race(out, "expected_position", "predicted_position", group_cols=None)
     return out.sort_values("predicted_position").reset_index(drop=True)
+
+
+def compute_live_track_record(frozen_at: str, stage: str) -> dict | None:
+    """Reads every predictions/{year}_race_v2_{stage}.csv (scripts/
+    predict_staged.py's output), keeps rows predicted at/after frozen_at,
+    and scores the ones with a real result in yet against the grid
+    baseline (only meaningful at stage="post_quali", where grid is a real
+    pre-race value rather than NaN) and, paired by (gp, driver), against
+    v1's own prediction for the same race from predictions/{year}.csv --
+    v1 only ever predicts post-quali, so this comparison is also only
+    populated at that stage. None if nothing's been predicted at this
+    stage since the freeze yet."""
+    files = sorted(PREDICTIONS_DIR.glob(f"*_race_v2_{stage}.csv")) if PREDICTIONS_DIR.exists() else []
+    frames = [pd.read_csv(p) for p in files]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return None
+
+    all_preds = pd.concat(frames, ignore_index=True)
+    all_preds["predicted_at"] = pd.to_datetime(all_preds["predicted_at"], utc=True)
+    cutoff = pd.Timestamp(frozen_at)
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+    live = all_preds[all_preds["predicted_at"] >= cutoff]
+    if live.empty:
+        return None
+
+    out = {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": int(live["gp"].nunique())}
+    scored = live.dropna(subset=["actual_position"])
+    out["n_races_scored"] = int(scored["gp"].nunique())
+    out["n_rows_scored"] = int(len(scored))
+    if scored.empty:
+        return out
+
+    out["model_mae"] = round(float((scored["predicted_position"] - scored["actual_position"]).abs().mean()), 3)
+    grid_known = scored.dropna(subset=["grid"])
+    if not grid_known.empty:
+        out["grid_mae"] = round(float((grid_known["grid"] - grid_known["actual_position"]).abs().mean()), 3)
+    pred_winners = scored[scored["predicted_position"] == 1]
+    out["model_winner_accuracy"] = (round(float((pred_winners["actual_position"] == 1).mean()), 3)
+                                    if not pred_winners.empty else None)
+    if "win_probability" in scored:
+        actual_win = (scored["actual_position"] == 1).astype(int)
+        out["win_brier"] = round(float(brier_score_loss(actual_win, scored["win_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    if "podium_probability" in scored:
+        actual_podium = (scored["actual_position"] <= 3).astype(int)
+        out["podium_brier"] = round(float(brier_score_loss(
+            actual_podium, scored["podium_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    if "points_probability" in scored:
+        actual_points = (scored["actual_position"] <= 10).astype(int)
+        out["points_brier"] = round(float(brier_score_loss(
+            actual_points, scored["points_probability"].clip(1e-6, 1 - 1e-6))), 4)
+
+    v1_frames = []
+    for year in {int(pd.to_datetime(d).year) for d in live["predicted_at"]}:
+        p = PREDICTIONS_DIR / f"{year}.csv"
+        if p.exists():
+            v1_frames.append(pd.read_csv(p))
+    if v1_frames:
+        v1_all = pd.concat(v1_frames, ignore_index=True).dropna(subset=["actual_position"])
+        paired = scored.merge(v1_all[["gp", "driver", "predicted_position", "actual_position"]],
+                              on=["gp", "driver"], suffixes=("_v2", "_v1"))
+        if not paired.empty:
+            out["n_rows_vs_v1"] = int(len(paired))
+            out["v2_mae_vs_v1_pairs"] = round(float((paired["predicted_position_v2"]
+                                                      - paired["actual_position_v2"]).abs().mean()), 3)
+            out["v1_mae_vs_v1_pairs"] = round(float((paired["predicted_position_v1"]
+                                                      - paired["actual_position_v1"]).abs().mean()), 3)
+    return out

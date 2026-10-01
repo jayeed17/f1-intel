@@ -47,7 +47,7 @@ from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-from app.config import FROZEN_MODEL_DIR, MODEL_DIR
+from app.config import FROZEN_MODEL_DIR, MODEL_DIR, PREDICTIONS_DIR
 
 # --------------------------------------------------------------------------
 # Features. All strictly pre-session: rolling/circuit-history columns are
@@ -562,3 +562,54 @@ def predict_quali(pipe: Pipeline, race_features: pd.DataFrame, meta: dict,
     out["expected_quali_position"] = sim["expected_position"]
     out = rank_within_race(out, "expected_quali_position", "predicted_quali_position", group_cols=None)
     return out.sort_values("predicted_quali_position").reset_index(drop=True)
+
+
+def compute_live_track_record(frozen_at: str, stage: str) -> dict | None:
+    """Reads every predictions/{year}_quali_{stage}.csv (scripts/predict_
+    staged.py's output), keeps rows predicted at/after frozen_at, and
+    scores the ones with a real quali result in yet, against both
+    baselines logged alongside the prediction (baseline_rolling_quali_pos,
+    baseline_last_year_quali_pos). None if nothing's been predicted at
+    this stage since the freeze yet."""
+    files = sorted(PREDICTIONS_DIR.glob(f"*_quali_{stage}.csv")) if PREDICTIONS_DIR.exists() else []
+    frames = [pd.read_csv(p) for p in files]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return None
+
+    all_preds = pd.concat(frames, ignore_index=True)
+    all_preds["predicted_at"] = pd.to_datetime(all_preds["predicted_at"], utc=True)
+    cutoff = pd.Timestamp(frozen_at)
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+    live = all_preds[all_preds["predicted_at"] >= cutoff]
+    if live.empty:
+        return None
+
+    out = {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": int(live["gp"].nunique())}
+    scored = live.dropna(subset=["actual_quali_position"])
+    out["n_races_scored"] = int(scored["gp"].nunique())
+    out["n_rows_scored"] = int(len(scored))
+    if scored.empty:
+        return out
+
+    out["model_mae"] = round(float((scored["predicted_quali_position"]
+                                    - scored["actual_quali_position"]).abs().mean()), 3)
+    if "baseline_rolling_quali_pos" in scored:
+        rolling = scored.dropna(subset=["baseline_rolling_quali_pos"])
+        if not rolling.empty:
+            out["baseline_rolling_mae"] = round(float((rolling["baseline_rolling_quali_pos"]
+                                                        - rolling["actual_quali_position"]).abs().mean()), 3)
+    if "baseline_last_year_quali_pos" in scored:
+        last_year = scored.dropna(subset=["baseline_last_year_quali_pos"])
+        if not last_year.empty:
+            out["baseline_last_year_mae"] = round(float((last_year["baseline_last_year_quali_pos"]
+                                                         - last_year["actual_quali_position"]).abs().mean()), 3)
+
+    pred_pole = scored[scored["predicted_quali_position"] == 1]
+    out["model_pole_accuracy"] = (round(float((pred_pole["actual_quali_position"] == 1).mean()), 3)
+                                  if not pred_pole.empty else None)
+    if "pole_probability" in scored:
+        actual_pole = (scored["actual_quali_position"] == 1).astype(int)
+        out["pole_brier"] = round(float(brier_score_loss(
+            actual_pole, scored["pole_probability"].clip(1e-6, 1 - 1e-6))), 4)
+    return out

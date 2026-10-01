@@ -32,9 +32,11 @@ from app.models.race_predictor import compute_live_track_record, frozen_model_sp
 from app.models.quali_predictor import ensure_trained as ensure_trained_quali  # noqa: E402
 from app.models.quali_predictor import predict_quali  # noqa: E402
 from app.models.quali_predictor import frozen_model_spec as frozen_quali_spec  # noqa: E402
+from app.models.quali_predictor import compute_live_track_record as compute_live_track_record_quali  # noqa: E402
 from app.models.race_predictor_v2 import ensure_trained as ensure_trained_race_v2  # noqa: E402
 from app.models.race_predictor_v2 import predict_race_v2  # noqa: E402
 from app.models.race_predictor_v2 import frozen_model_spec as frozen_race_v2_spec  # noqa: E402
+from app.models.race_predictor_v2 import compute_live_track_record as compute_live_track_record_v2  # noqa: E402
 from app.models.strategy import compare_actual, simulate  # noqa: E402
 
 st.set_page_config(page_title="F1 Intel", layout="wide")
@@ -422,6 +424,59 @@ def render_view() -> None:
             st.dataframe(pred_vs_actual[["driver", "Predicted quali", "Actual quali",
                                         "Predicted finish", "Actual finish"]],
                         width="stretch", hide_index=True)
+
+        with st.expander("Live track record by stage (quali vs baselines, race v1 vs v2 vs grid)"):
+            q_spec, v1_spec, v2_spec = frozen_quali_spec(), frozen_model_spec(), frozen_race_v2_spec()
+            st.caption("Each stage is scored only from predictions logged at or after its model's own "
+                      "freeze date, using scripts/predict_staged.py's per-stage prediction files -- a "
+                      "genuinely prospective test, not another look at CV data.")
+
+            st.markdown("**Qualifying model**")
+            if q_spec:
+                qcols = st.columns(2)
+                for qcol, qstage, qlabel in zip(qcols, ("forecast", "post_practice"),
+                                                ("Forecast", "Post-practice")):
+                    live_q = compute_live_track_record_quali(q_spec["frozen_at"], qstage)
+                    with qcol:
+                        st.caption(qlabel)
+                        if live_q is None:
+                            st.info("No predictions logged yet at this stage since the freeze.")
+                        elif live_q["n_races_scored"] == 0:
+                            st.info(f"{live_q['n_races_predicted']} race(s) predicted, none scored yet.")
+                        else:
+                            st.metric("Model MAE", live_q["model_mae"])
+                            if "baseline_rolling_mae" in live_q:
+                                st.caption(f"vs rolling-5 baseline: {live_q['baseline_rolling_mae']}")
+                            if "baseline_last_year_mae" in live_q:
+                                st.caption(f"vs last-year-here baseline: {live_q['baseline_last_year_mae']}")
+                            if live_q.get("pole_brier") is not None:
+                                st.caption(f"Pole Brier: {live_q['pole_brier']}")
+            else:
+                st.caption("Quali model not frozen yet.")
+
+            st.markdown("**Race model (v1 vs v2 vs grid)**")
+            if v1_spec:
+                rcols = st.columns(3)
+                for rcol, rstage, rlabel in zip(rcols, ("forecast", "post_practice", "post_quali"),
+                                                ("Forecast", "Post-practice", "Post-quali")):
+                    live_v2 = compute_live_track_record_v2(v2_spec["frozen_at"], rstage) if v2_spec else None
+                    with rcol:
+                        st.caption(rlabel)
+                        if live_v2 is None:
+                            st.info("No predictions logged yet at this stage since v2's freeze.")
+                        elif live_v2["n_races_scored"] == 0:
+                            st.info(f"{live_v2['n_races_predicted']} race(s) predicted, none scored yet.")
+                        else:
+                            st.metric("v2 MAE", live_v2["model_mae"])
+                            if "grid_mae" in live_v2:
+                                st.caption(f"vs grid baseline: {live_v2['grid_mae']}")
+                            if "v2_mae_vs_v1_pairs" in live_v2:
+                                st.caption(f"vs v1 (same races): v2 {live_v2['v2_mae_vs_v1_pairs']} / "
+                                          f"v1 {live_v2['v1_mae_vs_v1_pairs']}")
+                            if live_v2.get("win_brier") is not None:
+                                st.caption(f"Win Brier: {live_v2['win_brier']}")
+            else:
+                st.caption("Race v2 model not frozen yet.")
 
         with st.expander("Race v1 model diagnostics (feature importance, track record, calibration)"):
             delta_pipe, dnf_pipe, _meta = cached_predictor_models()

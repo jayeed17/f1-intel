@@ -5,11 +5,16 @@ on:
     # Monday 02:00 UTC covers essentially every race (latest Sunday finish is
     # ~22:00 UTC); Monday 14:00 UTC is a second pass for anything F1/OpenF1
     # hadn't published yet by the first run (--only-missing makes this cheap).
-    # Both Monday runs also score last weekend's race predictions.
+    # Both Monday runs also score last weekend's race predictions, and log a
+    # pre-weekend quali + race v2 forecast for whatever's coming up next.
     - cron: "0 2 * * 1"
     - cron: "0 14 * * 1"
+    # Saturday 16:00 UTC: FP3 has finished for essentially every race format
+    # by then (sprint weekends have no FP3 -- predict_staged just finds
+    # nothing in that window and no-ops) -- log a post-practice forecast.
+    - cron: "0 16 * * 6"
     # Saturday 20:00 UTC: qualifying has finished for essentially every race
-    # format by then -- log a race-outcome prediction before Sunday's race.
+    # format by then -- log race-outcome (v1 + v2) and post-quali predictions.
     - cron: "0 20 * * 6"
   workflow_dispatch: {}
 
@@ -38,16 +43,30 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Build missing prebuilt data
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 20 * * 6'
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
         run: python -m scripts.build_prebuilt --year 2026 --only-missing
 
       - name: Score predictions
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule != '0 20 * * 6'
-        run: python -m scripts.score_predictions --year 2026
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        run: |
+          python -m scripts.score_predictions --year 2026
+          python -m scripts.score_staged --year 2026
 
-      - name: Predict next race
+      - name: Forecast next race (quali + race v2, pre-weekend)
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        run: python -m scripts.predict_staged --stage forecast
+
+      - name: Post-practice forecast (quali + race v2, after FP3)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 16 * * 6'
+        run: python -m scripts.predict_staged --stage post_practice
+
+      - name: Predict next race (v1, post-quali)
         if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
         run: python -m scripts.predict_next_race
+
+      - name: Post-quali race predictions (v2)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        run: python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
         run: |
