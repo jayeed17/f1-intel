@@ -95,9 +95,9 @@ FINAL_COLUMNS = [
     "target_finish_pos", "target_points_top10", "target_delta",
     # circuit history (last 3 prior editions of this exact circuit identity)
     "circuit_new_or_changed",
-    "driver_circuit_avg_quali_3", "driver_circuit_avg_finish_3",
+    "driver_circuit_avg_quali_3", "driver_circuit_avg_finish_3", "driver_circuit_last_quali",
     "driver_circuit_races_here", "driver_circuit_hist_pre_reg_change",
-    "team_circuit_avg_quali_3", "team_circuit_avg_finish_3",
+    "team_circuit_avg_quali_3", "team_circuit_avg_finish_3", "team_circuit_last_quali",
     "team_circuit_races_here", "team_circuit_hist_pre_reg_change",
     # rolling qualifying form
     "driver_rolling_quali_position_3", "driver_rolling_quali_position_5",
@@ -374,6 +374,7 @@ def add_circuit_history_and_quali_rolling_features(df: pd.DataFrame) -> pd.DataF
             lambda s: s.shift(1).rolling(3, min_periods=1).mean())
         d[f"{prefix}_circuit_avg_finish_3"] = grp["target_finish_pos"].transform(
             lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        d[f"{prefix}_circuit_last_quali"] = grp["quali_position"].transform(lambda s: s.shift(1))
         d[f"{prefix}_circuit_races_here"] = grp.cumcount()  # count of PRIOR editions, 0 for the first
         prior_min_season = grp["season"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).min())
         d[f"{prefix}_circuit_hist_pre_reg_change"] = [
@@ -382,6 +383,7 @@ def add_circuit_history_and_quali_rolling_features(df: pd.DataFrame) -> pd.DataF
         ]
         return d[[entity_col, "_hist_key", "season", "round",
                  f"{prefix}_circuit_avg_quali_3", f"{prefix}_circuit_avg_finish_3",
+                 f"{prefix}_circuit_last_quali",
                  f"{prefix}_circuit_races_here", f"{prefix}_circuit_hist_pre_reg_change"]]
 
     df = df.merge(_circuit_history("driver", "driver"), on=["driver", "_hist_key", "season", "round"], how="left")
