@@ -367,14 +367,26 @@ def render_view() -> None:
         quali_pipe, quali_meta = cached_quali_models()
         quali_preds = predict_quali(quali_pipe, race_feats, quali_meta)
 
+        v1_delta_pipe, v1_dnf_pipe, v1_meta = cached_predictor_models()
         race_delta_pipe, race_dnf_pipe, race_meta = cached_race_v2_models()
         if stage in ("Forecast", "Post-practice"):
-            race_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta,
-                                        quali_pipe=quali_pipe, quali_meta=quali_meta, quali_features=race_feats)
-            st.caption("Grid not known yet -- each of the race model's 10k Monte Carlo runs samples its own "
-                      "simulated qualifying order from the quali model, instead of using one fixed projection.")
+            race_v2_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta,
+                                            quali_pipe=quali_pipe, quali_meta=quali_meta, quali_features=race_feats)
+            race_v1_preds = None  # v1 has no mechanism to predict without a known grid
         else:
-            race_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta)
+            race_v1_preds = predict_race(v1_delta_pipe, v1_dnf_pipe, race_feats, v1_meta)
+            race_v2_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta)
+
+        def _fmt_race_table(preds: pd.DataFrame) -> pd.DataFrame:
+            show = preds[["predicted_position", "driver", "team_id", "win_probability",
+                         "podium_probability", "points_probability"]].copy()
+            for c in ("win_probability", "podium_probability", "points_probability"):
+                show[c] = show[c] * 100
+            return show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
+                                        "team_id": "Team", "win_probability": "P(win)",
+                                        "podium_probability": "P(podium)", "points_probability": "P(points)"})
+
+        _pct_cols = {c: st.column_config.NumberColumn(format="%.1f%%") for c in ("P(win)", "P(podium)", "P(points)")}
 
         col1, col2 = st.columns(2)
         with col1:
@@ -391,18 +403,24 @@ def render_view() -> None:
                         column_config={c: st.column_config.NumberColumn(format="%.1f%%")
                                       for c in ("P(pole)", "P(top 3)", "P(Q3)")})
         with col2:
-            st.markdown("**Race**")
-            r_show = race_preds[["predicted_position", "driver", "team_id", "win_probability",
-                                 "podium_probability", "points_probability"]].copy()
-            for c in ("win_probability", "podium_probability", "points_probability"):
-                r_show[c] = r_show[c] * 100
-            r_show = r_show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
-                                            "team_id": "Team", "win_probability": "P(win)",
-                                            "podium_probability": "P(podium)",
-                                            "points_probability": "P(points)"})
-            st.dataframe(r_show, width="stretch", hide_index=True,
-                        column_config={c: st.column_config.NumberColumn(format="%.1f%%")
-                                      for c in ("P(win)", "P(podium)", "P(points)")})
+            st.markdown("**Race (v1.0.0 — primary)**")
+            if race_v1_preds is None:
+                st.info("v1 needs a known grid, so it can't predict before qualifying -- see the "
+                       "experimental v2 estimate below, which samples its grid from the quali model.")
+            else:
+                st.dataframe(_fmt_race_table(race_v1_preds), width="stretch", hide_index=True,
+                            column_config=_pct_cols)
+                st.caption("v1 has the better win-probability calibration on holdout (see README) -- "
+                          "this is the model `predictions/{year}.csv` and `predict_next_race.py` use.")
+
+        st.markdown("**Race v2 (experimental — circuit history + quali-sampled grid)**")
+        st.dataframe(_fmt_race_table(race_v2_preds), width="stretch", hide_index=True, column_config=_pct_cols)
+        if stage in ("Forecast", "Post-practice"):
+            st.caption("Grid not known yet -- each of v2's 10k Monte Carlo runs samples its own simulated "
+                      "qualifying order from the quali model, instead of using one fixed projection.")
+        else:
+            st.caption("v2 does not beat v1 or the grid baseline on holdout, and is significantly worse on "
+                      "win-probability calibration specifically -- shown for comparison, not as the primary call.")
 
         st.subheader("Track history")
         hist = _track_history_table(race_feats)
@@ -418,11 +436,15 @@ def render_view() -> None:
             pred_vs_actual = quali_preds[["driver", "predicted_quali_position"]].rename(
                 columns={"predicted_quali_position": "Predicted quali"})
             pred_vs_actual = pred_vs_actual.merge(
-                race_preds[["driver", "predicted_position"]].rename(
-                    columns={"predicted_position": "Predicted finish"}), on="driver")
+                race_v1_preds[["driver", "predicted_position"]].rename(
+                    columns={"predicted_position": "Predicted finish (v1)"}), on="driver")
+            pred_vs_actual = pred_vs_actual.merge(
+                race_v2_preds[["driver", "predicted_position"]].rename(
+                    columns={"predicted_position": "Predicted finish (v2, experimental)"}), on="driver")
             pred_vs_actual = pred_vs_actual.merge(actual, on="driver").sort_values("Actual finish")
             st.dataframe(pred_vs_actual[["driver", "Predicted quali", "Actual quali",
-                                        "Predicted finish", "Actual finish"]],
+                                        "Predicted finish (v1)", "Predicted finish (v2, experimental)",
+                                        "Actual finish"]],
                         width="stretch", hide_index=True)
 
         with st.expander("Live track record by stage (quali vs baselines, race v1 vs v2 vs grid)"):
@@ -479,9 +501,8 @@ def render_view() -> None:
                 st.caption("Race v2 model not frozen yet.")
 
         with st.expander("Race v1 model diagnostics (feature importance, track record, calibration)"):
-            delta_pipe, dnf_pipe, _meta = cached_predictor_models()
             st.caption("Feature importance (permutation, full dataset)")
-            imp_delta, imp_dnf = cached_feature_importance(delta_pipe, dnf_pipe)
+            imp_delta, imp_dnf = cached_feature_importance(v1_delta_pipe, v1_dnf_pipe)
             ecol1, ecol2 = st.columns(2)
             with ecol1:
                 st.caption("Positions-gained (delta) model -- MAE increase when shuffled")
