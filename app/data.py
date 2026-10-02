@@ -204,6 +204,42 @@ def _openf1_find_session(year: int, gp: str | int, session: str) -> dict:
     return rows[-1]
 
 
+def openf1_meetings(year: int) -> list[dict]:
+    """Best-effort: every OpenF1 "meeting" (race weekend) for `year`,
+    including cancelled ones (OpenF1's own `is_cancelled` flag -- FastF1's
+    get_event_schedule() has no equivalent column at all). [] on any
+    failure; callers must treat that as "couldn't check", not "nothing is
+    cancelled", and degrade to showing everything unfiltered."""
+    try:
+        return _openf1_get("meetings", year=year)
+    except OpenF1Error:
+        return []
+
+
+def is_event_cancelled(meetings: list[dict], event_name: str, event_date) -> bool:
+    """True if the OpenF1 meeting named `event_name` CLOSEST in date to
+    `event_date` is cancelled. Matching by nearest date (not just name)
+    matters because a cancelled-then-rescheduled event can appear twice
+    under the same name with opposite flags -- e.g. 2026 Bahrain GP's
+    original April slot was cancelled and the race moved to October; a
+    name-only match would wrongly flag the real October race as
+    cancelled forever. False (not cancelled) if there's no OpenF1 meeting
+    by that name at all, or the check can't run (meetings is empty)."""
+    candidates = [m for m in meetings if m.get("meeting_name") == event_name and m.get("date_start")]
+    if not candidates:
+        return False
+    target = pd.Timestamp(event_date)
+    target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+
+    def _dist(m: dict) -> float:
+        d = pd.Timestamp(m["date_start"])
+        d = d.tz_localize("UTC") if d.tzinfo is None else d.tz_convert("UTC")
+        return abs((d - target).total_seconds())
+
+    nearest = min(candidates, key=_dist)
+    return bool(nearest.get("is_cancelled", False))
+
+
 class OpenF1Session:
     """Duck-typed stand-in for a FastF1 Session, backed by the OpenF1 API.
     Used when a race isn't in the prebuilt bundle."""
@@ -903,6 +939,40 @@ def race_stage_for(year: int, gp: str) -> str:
     if "FP2" in sessions or "FP3" in sessions:
         return "Post-practice"
     return "Forecast"
+
+
+def predictions_race_options(year: int = 2026) -> tuple[list[dict], list[str]]:
+    """Every `year` race for the dashboard's Predictions dropdown -- not
+    just the next one. Built (prebuilt-bundle) rounds come first, in
+    round order, then every remaining round on FastF1's calendar that
+    hasn't been built yet (Forecast/Post-practice/Post-quali, depending
+    on what's actually happened), cross-checked against OpenF1's
+    cancellation flag via is_event_cancelled() so a cancelled-with-no-
+    reschedule round (e.g. 2026 Saudi Arabia) doesn't show up as a fake
+    upcoming race -- a cancelled-then-rescheduled one (e.g. 2026 Bahrain,
+    moved from April to October) is correctly kept, matched by date not
+    just name. Returns (races, excluded_names): races is
+    [{"year", "name", "round"}, ...] sorted by round; excluded_names
+    lists any cancelled rounds left out, for a UI note -- empty if
+    nothing was cancelled or the schedule/OpenF1 calls failed (degrades
+    to showing the built rounds alone rather than guessing)."""
+    races = sorted((r for r in prebuilt_races() if r["year"] == year), key=lambda r: r["round"])
+    out = [{"year": r["year"], "name": r["name"], "round": r["round"]} for r in races]
+    built_rounds = {r["round"] for r in races}
+    excluded: list[str] = []
+    try:
+        sch = fastf1.get_event_schedule(year, include_testing=False)
+    except Exception:
+        return out, excluded
+
+    meetings = openf1_meetings(year)
+    upcoming = sch[~sch["RoundNumber"].isin(built_rounds)].sort_values("RoundNumber")
+    for _, row in upcoming.iterrows():
+        if meetings and is_event_cancelled(meetings, row["EventName"], row["EventDate"]):
+            excluded.append(row["EventName"])
+            continue
+        out.append({"year": year, "name": row["EventName"], "round": int(row["RoundNumber"])})
+    return out, excluded
 
 
 def to_records(df: pd.DataFrame) -> list[dict]:

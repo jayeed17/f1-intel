@@ -21,8 +21,8 @@ from app.analysis.team_report import team_report  # noqa: E402
 from app.config import RACE_DATASET_PATH  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
                       forecast_features, get_lap, get_session, has_position_data, lap_telemetry,
-                      load_session, prebuilt_built_at, prebuilt_races, race_laps,
-                      race_prediction_features, race_stage_for, session_missing)
+                      load_session, prebuilt_built_at, prebuilt_races, predictions_race_options,
+                      race_laps, race_prediction_features, race_stage_for, session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.race_predictor import DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS  # noqa: E402
 from app.models.race_predictor import FEATURES_DELTA, FEATURES_DNF, TARGET_DELTA, TARGET_DNF  # noqa: E402
@@ -103,27 +103,17 @@ def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
     return labels, mapping
 
 
-def _predictions_race_options() -> tuple[list[str], dict[str, dict]]:
-    """2026 race dropdown, oldest round first: every prebuilt 2026 race,
-    plus -- best effort -- the next round not in the manifest yet, so a
-    genuine pre-weekend "Forecast" entry can show up. The schedule lookup
-    is wrapped in its own try/except and silently skipped if it fails
-    (e.g. on Streamlit Cloud, which can't reach FastF1 at all) so the rest
-    of the dropdown still works from the prebuilt bundle alone."""
-    races = sorted((r for r in prebuilt_races() if r["year"] == 2026), key=lambda r: r["round"])
-    options = {f"{r['name']} {r['year']}": {"year": r["year"], "name": r["name"], "round": r["round"]}
-              for r in races}
-    built_rounds = {r["round"] for r in races}
-    try:
-        sch = fastf1.get_event_schedule(2026, include_testing=False)
-        upcoming = sch[~sch["RoundNumber"].isin(built_rounds)].sort_values("RoundNumber")
-        if not upcoming.empty:
-            nxt = upcoming.iloc[0]
-            options[f"{nxt['EventName']} 2026"] = {"year": 2026, "name": nxt["EventName"],
-                                                   "round": int(nxt["RoundNumber"])}
-    except Exception:
-        pass
-    return list(options.keys()), options
+@st.cache_data(ttl=3600, show_spinner=False)
+def _predictions_race_options() -> tuple[list[str], dict[str, dict], list[str]]:
+    """2026 race dropdown, oldest round first: every prebuilt 2026 race
+    (Result/Post-quali/Post-practice, whatever's actually built) plus
+    EVERY remaining round on the calendar (Forecast), not just the next
+    one -- see app.data.predictions_race_options() for the cancelled-vs-
+    rescheduled cross-check against OpenF1. Cached for an hour since this
+    calls both FastF1's schedule and OpenF1's meetings endpoint."""
+    races, excluded = predictions_race_options(2026)
+    options = {f"{r['name']} {r['year']}": r for r in races}
+    return list(options.keys()), options, excluded
 
 
 def _default_predictions_index(options: dict[str, dict]) -> int:
@@ -339,10 +329,12 @@ def render_view() -> None:
             st.warning("Race dataset not built yet -- run `python -m scripts.build_race_dataset`.")
             return
 
-        labels, options = _predictions_race_options()
+        labels, options, excluded = _predictions_race_options()
         if not labels:
             st.warning("No 2026 race data available yet.")
             return
+        if excluded:
+            st.caption(f"Excluded as cancelled this season: {', '.join(excluded)}.")
         pred_label = st.selectbox("2026 race", labels, index=_default_predictions_index(options),
                                   key="predictions_race")
         race_info = options[pred_label]
