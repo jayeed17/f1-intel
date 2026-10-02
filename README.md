@@ -30,6 +30,8 @@ Built on [FastF1](https://docs.fastf1.dev) (official F1 timing feed, 2018+), Fas
 | Team report | Sector gaps, speed-trap deficit, race pace, pit lane time, auto "where to improve" notes |
 | Tyre ML model | Gradient-boosted model predicting lap-time loss from tyre age, compound, fuel, temps, circuit, validated leave-circuit-out |
 | Race predictor | Positions-gained + DNF models combined via Monte Carlo simulation into P(win)/P(podium)/P(points) per driver; dev/holdout CV'd against grid/quali baselines — [track record and honest results below](#race-outcome-predictor) |
+| Qualifying predictor | Positions-gained-vs-rolling-form regressor + Monte Carlo into P(pole)/P(top 3)/P(Q3)/expected position; same trained pipeline works pre-weekend and post-practice (NaN-tolerant FP features) — [results below](#qualifying-predictor) |
+| Race predictor v2 | v1 + circuit history (driver/team avg quali/finish at this track, last 3 editions) + rolling quali form; pre-quali, samples its grid from the qualifying model's own simulated distribution instead of one fixed projection — [v2 vs v1 vs grid below](#race-predictor-v2) |
 
 ## Quickstart
 
@@ -124,6 +126,83 @@ The clean, ongoing, genuinely prospective test: `predictions/{year}.csv` rows lo
 
 Weekly predictions are logged automatically: `scripts/predict_next_race.py` runs after qualifying (Saturday 20:00 UTC) and appends predicted position + P(win)/P(podium)/P(points) per driver to `predictions/{year}.csv`; `scripts/score_predictions.py` runs after the race (Monday) and fills in actual results. Both fail loudly (non-zero exit) if expected data is missing rather than silently doing nothing.
 
+## Qualifying predictor
+
+A `HistGradientBoostingRegressor` predicting `target_quali_delta = quali_position − driver_rolling_quali_position_3` (same positions-gained-vs-form framing as the race predictor), Monte Carlo simulated into P(pole)/P(top 3)/P(Q3) and an expected position. "Pre-weekend" and "post-practice" aren't two models — `fp_best_gap_s`/`fp_long_run_gap_s` (best/long-run FP2–FP3 pace gap to the fastest car) are NaN before practice happens and populated after; `HistGradientBoosting` handles missing values natively, so the one trained pipeline quietly improves once those columns fill in. Features also include circuit quali history (driver/team avg + last-year quali position here, last 3 editions), rolling quali form (last 3/5), and the teammate quali-gap trend. Baselines: rolling quali position (last 5), and the single most recent prior edition's quali position at this circuit ("last year here").
+
+**Holdout (2025–2026, 38 races, 781 driver-rows)**:
+
+| metric | model | rolling-5 baseline | last-year-here baseline |
+|---|---|---|---|
+| position MAE (↓) | **3.11** | 3.15 | 4.62 |
+| Spearman (↑) | 0.747 | 0.746 | 0.498 |
+| top-3 hit rate | **0.76** | 0.68 | 0.55 |
+| pole accuracy | 0.21 | **0.26** | 0.16 |
+
+Probabilistic (Brier, lower is better) vs the rolling-position-bucket baseline (empirical P(outcome \| rolling bucket), fit on 2022–2024 only):
+
+| outcome | model Brier | baseline Brier |
+|---|---|---|
+| pole | **0.0406** | 0.0427 |
+| top 3 | **0.0784** | 0.0812 |
+| Q3 | **0.1338** | 0.1414 |
+
+**Bootstrap 95% CIs** (2,000 resamples of whole holdout races):
+
+| difference (model − baseline) | mean | 95% CI | significant? |
+|---|---|---|---|
+| position MAE vs rolling-5 | −0.047 | [−0.177, +0.079] | no — CI includes 0 |
+| pole Brier vs rolling-bucket baseline | −0.0020 | [−0.0056, +0.0015] | no — CI includes 0 |
+
+**Top features** (permutation importance, MAE increase when shuffled): `driver_rolling_quali_position_3` (0.76), `driver_rolling_quali_position_5` (0.28), `team_circuit_last_quali` (0.17), `fp_best_gap_s` (0.08), `teammate_quali_gap_trend_3` (0.05), `driver_circuit_avg_quali_3` (0.05).
+
+**Honest result**: clearly beats the weak last-year-here baseline, but is statistically indistinguishable from the simple rolling-5-position baseline on both position MAE and pole-probability calibration — same story as the race predictor. The model does lean its way on point estimates (MAE, top-3 hit rate, both Brier scores) while the baseline wins on pole accuracy specifically, but none of it clears the 38-race sample's noise floor. **Frozen as quali v1.0.0** (`data/model/frozen/quali_model.joblib` + `quali_spec.json`, frozen 2026-10-01) — `app/models/quali_predictor.py::ensure_trained()` loads this exact snapshot everywhere (dashboard, `scripts/predict_staged.py`), never a freshly self-trained copy.
+
+## Race predictor v2
+
+v1's exact features plus circuit history (driver/team avg quali position + avg finish at this circuit over the last 3 prior editions, races-raced-here count, a `circuit_new_or_changed` flag for brand-new or materially-relaid venues) and driver/team rolling quali form. The one new mechanic: **before qualifying, each of the 10,000 Monte Carlo runs samples its own grid from the qualifying model's simulated rank distribution** (`simulate_quali_positions(..., return_ranks=True)`) instead of collapsing qualifying uncertainty to one fixed projected grid first — so a driver who's simulated on pole in some runs and P8 in others carries that spread into the race simulation itself. v1 (`data/model/frozen/model.joblib`) stays frozen and running, completely untouched; v2 is a separate, additional model.
+
+**Holdout (2025–2026, 38 races, 787 driver-rows)**, v2 vs the **grid baseline**:
+
+| metric | v2 | grid |
+|---|---|---|
+| position MAE (↓) | 3.347 | **3.366** |
+| Spearman (↑) | **0.665** | 0.651 |
+| top-3 hit rate | **0.842** | 0.816 |
+| winner accuracy | 0.526 | **0.658** |
+| points F1 | **0.771** | 0.768 |
+
+Probabilistic (Brier, lower is better) vs a baseline that turns grid position into a probability (empirical P(outcome \| grid slot), fit on 2022–2024 only):
+
+| outcome | v2 Brier | grid-probability baseline Brier |
+|---|---|---|
+| win | 0.0305 | **0.0261** |
+| podium | 0.0649 | **0.0610** |
+| points | 0.1622 | **0.1626** (tie) |
+
+**Bootstrap 95% CIs vs the grid baseline** (2,000 resamples of whole holdout races):
+
+| difference (v2 − grid) | mean | 95% CI | significant? |
+|---|---|---|---|
+| position MAE | −0.018 | [−0.136, +0.102] | no — CI includes 0 |
+| points Brier | −0.0004 | [−0.007, +0.006] | no — CI includes 0 |
+| win Brier | **+0.0045** | **[+0.0007, +0.0085]** | **yes — v2 is worse** |
+
+**v2 vs v1** (paired bootstrap on the identical 38 holdout races, re-running v1's own private walk-forward/calibration code on the same dataset — not touching v1's frozen artifact):
+
+| difference (v2 − v1) | mean | 95% CI | significant? |
+|---|---|---|---|
+| position MAE | +0.047 | [−0.028, +0.116] | no — CI includes 0 |
+| win Brier | +0.0023 | [−0.0003, +0.0050] | no — CI includes 0 (borderline) |
+
+**Top features** (permutation importance on the positions-gained model, MAE increase when shuffled): `grid` (2.04), `team_rolling_avg_finish_3` (0.27), `driver_rolling_avg_finish_5` (0.23), `team_circuit_avg_finish_3` (0.05), `quali_gap_to_pole_s` (0.04), `quali_position` (0.04), `driver_circuit_avg_quali_3` (0.03). Circuit history ranks well below grid and rolling race-finish form — it's a real but minor signal here, not the headline feature the dataset work invested in.
+
+**Honest result: circuit history doesn't move the needle, and v2 is a step sideways at best.** v2 vs v1 is not significantly different either direction. v2 vs the grid baseline is a *significant* loss on win-Brier calibration specifically (CI entirely above 0) — the same win-calibration fragility v1 had before its grid-bucket-noise + isotonic-calibration fix, now reappearing in v2 despite using the identical fix, likely because circuit history and the quali-sampled grid add enough extra variance to the win-probability tail that the isotonic calibrator (fit on 2022–2024 dev data) under-corrects it on 2025–2026. Every other metric is statistically a wash. **Frozen as race v2.0.0** (`data/model/frozen/race_v2_model.joblib` + `race_v2_spec.json`, frozen 2026-10-01).
+
+### Live track record by stage
+
+`scripts/predict_staged.py` logs quali + race v2 predictions to `predictions/{year}_quali_{stage}.csv` / `predictions/{year}_race_v2_{stage}.csv` at three points in a race weekend — `forecast` (Monday, before FP1), `post_practice` (Saturday, after FP3), `post_quali` (Saturday, after qualifying) — and `scripts/score_staged.py` fills in actual results once they're in. v1 keeps logging to its own unchanged `predictions/{year}.csv` via `predict_next_race.py`. The dashboard's Predictions view has a "Live track record by stage" panel scoring each stage independently (quali model vs its two baselines; race v2 vs the grid baseline and vs v1, paired on the same races) from predictions logged at or after each model's own freeze date — genuinely prospective, not CV re-examined. As of this freeze (2026-10-01), no stage has a scored race yet; it fills in automatically as the new Monday/Saturday-16:00/Saturday-20:00 UTC crons run going forward.
+
 ## Method notes and limits
 
 - **Brake data is on/off, not pressure**, and car data is ~3.7 Hz. Brake points are accurate to roughly one sample (~20 m at speed).
@@ -139,22 +218,27 @@ app/
   config.py            constants (fuel effect, pit loss, thresholds)
   data.py              session loading, caching, lap/telemetry helpers, JSON serialisation
   analysis/            braking.py, delta.py, pits.py, team_report.py
-  models/              degradation.py, strategy.py, tyre_ml.py, race_predictor.py
+  models/              degradation.py, strategy.py, tyre_ml.py, race_predictor.py, quali_predictor.py, race_predictor_v2.py
 dashboard/streamlit_app.py
 scripts/train_tyre_model.py
 scripts/smoke_test.py   exercises every route's functions against a real session
-scripts/build_prebuilt.py   builds data/prebuilt/ (run locally or by the update-data Action)
+scripts/build_prebuilt.py   builds data/prebuilt/ (run locally or by the update-data Action); FP1-3 are laps-only
 scripts/build_race_dataset.py   builds data/model/race_dataset.parquet (run locally, not by any Action)
 scripts/freeze_race_predictor.py   trains + commits data/model/frozen/ (run locally, manually, rarely)
-scripts/predict_next_race.py   logs a prediction row per driver to predictions/{year}.csv (Action: Saturday 20:00 UTC) using ONLY the frozen model
-scripts/score_predictions.py   fills in actual results once a race is over (Action: Monday)
+scripts/freeze_quali_predictor.py   same, for the qualifying model
+scripts/freeze_race_predictor_v2.py   same, for race predictor v2
+scripts/predict_next_race.py   logs a prediction row per driver to predictions/{year}.csv (Action: Saturday 20:00 UTC) using ONLY the frozen v1 model
+scripts/predict_staged.py   logs staged quali/race-v2 predictions (forecast/post_practice/post_quali) to predictions/{year}_{model}_{stage}.csv
+scripts/score_predictions.py   fills in actual results for v1 once a race is over (Action: Monday)
+scripts/score_staged.py   fills in actual results for the staged quali/race-v2 files
 tests/                 offline tests on synthetic data
 data/processed/{year}/{round}.parquet   Parquet cache for live-loaded races (gitignored)
 data/prebuilt/{year}/{round}/{session}/   committed prebuilt bundle: laps/results/corners/telemetry parquet + manifest.json
 data/model/race_dataset.parquet   committed race-predictor training set, one row per driver per race
-data/model/frozen/   committed frozen race-predictor snapshot (model.joblib + spec.json: version, frozen_at, hyperparams)
-predictions/{year}.csv   committed public track record of weekly predictions vs actual results
-.github/workflows/update-data.yml   rebuilds data/prebuilt/ twice a week; scores/predicts races on its own cron
+data/model/frozen/   committed frozen snapshots: v1 (model.joblib), quali (quali_model.joblib), v2 (race_v2_model.joblib) + each one's spec.json (version, frozen_at, hyperparams)
+predictions/{year}.csv   committed public track record of v1's weekly predictions vs actual results
+predictions/{year}_quali_{stage}.csv, predictions/{year}_race_v2_{stage}.csv   same, per stage, for the quali and race v2 models
+.github/workflows/update-data.yml   rebuilds data/prebuilt/ on its own cron; scores/predicts races (v1 + staged) on theirs
 docs/img/              README screenshots
 ```
 
