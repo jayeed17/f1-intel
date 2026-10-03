@@ -17,12 +17,17 @@ from plotly.subplots import make_subplots  # noqa: E402
 from app.analysis.braking import assign_corners, braking_zones, compare_corners  # noqa: E402
 from app.analysis.delta import lap_delta, minisector_dominance  # noqa: E402
 from app.analysis.pits import estimate_pit_loss, pit_stops  # noqa: E402
+from app.analysis.street_circuits import (braking_summary_by_class, circuit_history_table,  # noqa: E402
+                                          classify_circuit, live_track_record_by_class,
+                                          model_accuracy_by_class, sc_vsc_frequency_by_class,
+                                          street_vs_permanent_metrics)
 from app.analysis.team_report import team_report  # noqa: E402
-from app.config import RACE_DATASET_PATH  # noqa: E402
+from app.config import PREDICTIONS_DIR, RACE_DATASET_PATH  # noqa: E402
 from app.data import (DataError, SessionLoadError, clean_laps, corners,  # noqa: E402
                       forecast_features, get_lap, get_session, has_position_data, lap_telemetry,
-                      load_session, prebuilt_built_at, prebuilt_races, predictions_race_options,
-                      race_laps, race_prediction_features, race_stage_for, session_missing)
+                      load_session, prebuilt_braking_samples, prebuilt_built_at, prebuilt_races,
+                      prebuilt_sc_vsc_flags, predictions_race_options, race_laps,
+                      race_prediction_features, race_stage_for, session_missing)
 from app.models.degradation import compound_model, stint_degradation  # noqa: E402
 from app.models.race_predictor import DEFAULT_DELTA_PARAMS, DEFAULT_DNF_PARAMS  # noqa: E402
 from app.models.race_predictor import FEATURES_DELTA, FEATURES_DNF, TARGET_DELTA, TARGET_DNF  # noqa: E402
@@ -46,7 +51,7 @@ COMPOUND_COLORS = {"SOFT": "#E8002D", "MEDIUM": "#FFD12E", "HARD": "#F0F0EC"}
 # These three need per-lap car telemetry (heavy); the rest only need lap timing.
 TELEMETRY_VIEWS = ["Braking", "Head to head", "Track dominance"]
 PARQUET_VIEWS = ["Tyre degradation", "Strategy", "Team report"]
-PREDICTOR_VIEWS = ["Predictions"]
+PREDICTOR_VIEWS = ["Predictions", "Street circuits"]
 _SESSION_ORDER = ["FP1", "FP2", "FP3", "SQ", "S", "Q", "R"]
 
 
@@ -95,6 +100,21 @@ def cached_feature_importance(_delta_pipe, _dnf_pipe) -> tuple[pd.DataFrame, pd.
     return imp_delta, imp_dnf
 
 
+@st.cache_data(show_spinner="Scanning prebuilt laps for safety car / VSC periods...")
+def cached_sc_vsc_flags() -> pd.DataFrame:
+    return prebuilt_sc_vsc_flags()
+
+
+@st.cache_data(show_spinner="Reading prebuilt telemetry for braking zones (one race per circuit)...")
+def cached_braking_samples() -> pd.DataFrame:
+    return prebuilt_braking_samples()
+
+
+@st.cache_data(show_spinner="Evaluating race predictor by circuit class (walk-forward CV + Monte Carlo)...")
+def cached_model_accuracy_by_class() -> dict:
+    return model_accuracy_by_class(pd.read_parquet(RACE_DATASET_PATH))
+
+
 def _race_options() -> tuple[list[str], dict[str, tuple[int, str]]]:
     """Race dropdown labels, newest first, straight from the prebuilt manifest."""
     races = prebuilt_races()
@@ -114,6 +134,26 @@ def _predictions_race_options() -> tuple[list[str], dict[str, dict], list[str]]:
     races, excluded = predictions_race_options(2026)
     options = {f"{r['name']} {r['year']}": r for r in races}
     return list(options.keys()), options, excluded
+
+
+def _resolve_circuit_id(dataset: pd.DataFrame, year: int, round_: int, event_name: str) -> str | None:
+    """circuit_id for (year, round) if the training dataset already has
+    that exact row, else the most recent circuit_id recorded anywhere in
+    the dataset under the same event name. data/model/race_dataset.parquet
+    is rebuilt locally only and lags the live prebuilt bundle/calendar by
+    a round or two (e.g. right now it stops at round 14 while the
+    calendar's already well past that) -- without this fallback, every
+    round past the dataset's own cutoff looks like a brand-new circuit
+    (None -> "permanent" in classify_circuit, NaN track history) even
+    when it's a venue the dataset has plenty of history for under an
+    earlier season. Event names are stable across seasons (circuit
+    *layout* changes are keyed by circuit_id via CIRCUIT_HISTORY_RESET,
+    not by event name, so this fallback doesn't fight that)."""
+    exact = dataset[(dataset["season"] == year) & (dataset["round"] == round_)]
+    if not exact.empty:
+        return exact["circuit_id"].iloc[0]
+    by_name = dataset[dataset["event_name"] == event_name].sort_values(["season", "round"])
+    return by_name["circuit_id"].iloc[-1] if not by_name.empty else None
 
 
 def _default_predictions_index(options: dict[str, dict]) -> int:
@@ -159,6 +199,31 @@ def _track_history_table(race_feats: pd.DataFrame) -> pd.DataFrame:
     return hist.sort_values("Driver races here", ascending=False)
 
 
+def _fmt_quali_table(preds: pd.DataFrame) -> pd.DataFrame:
+    show = preds[["predicted_quali_position", "driver", "team_id", "pole_probability",
+                 "top3_probability", "q3_probability", "expected_quali_position"]].copy()
+    for c in ("pole_probability", "top3_probability", "q3_probability"):
+        show[c] = show[c] * 100
+    return show.rename(columns={"predicted_quali_position": "Predicted", "driver": "Driver",
+                                "team_id": "Team", "pole_probability": "P(pole)",
+                                "top3_probability": "P(top 3)", "q3_probability": "P(Q3)",
+                                "expected_quali_position": "Expected pos."})
+
+
+def _fmt_race_table(preds: pd.DataFrame) -> pd.DataFrame:
+    show = preds[["predicted_position", "driver", "team_id", "win_probability",
+                 "podium_probability", "points_probability"]].copy()
+    for c in ("win_probability", "podium_probability", "points_probability"):
+        show[c] = show[c] * 100
+    return show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
+                                "team_id": "Team", "win_probability": "P(win)",
+                                "podium_probability": "P(podium)", "points_probability": "P(points)"})
+
+
+_QUALI_PCT_COLS = {c: st.column_config.NumberColumn(format="%.1f%%") for c in ("P(pole)", "P(top 3)", "P(Q3)")}
+_RACE_PCT_COLS = {c: st.column_config.NumberColumn(format="%.1f%%") for c in ("P(win)", "P(podium)", "P(points)")}
+
+
 with st.sidebar:
     race_labels, race_map = _race_options()
     if not race_labels:
@@ -172,7 +237,7 @@ with st.sidebar:
         kind = st.selectbox("Session", _SESSION_ORDER, index=_SESSION_ORDER.index("Q"))
     elif view in PREDICTOR_VIEWS:
         kind = "Q"
-        st.caption("Has its own 2026 race picker below -- the sidebar race selection doesn't apply here.")
+        st.caption("Doesn't use the sidebar race selection -- see its own picker/sections below.")
     else:
         kind = "R"
         st.caption("Uses Race session data.")
@@ -347,7 +412,7 @@ def render_view() -> None:
 
         dataset = pd.read_parquet(RACE_DATASET_PATH)
         circuit_row = dataset[(dataset["season"] == pred_year) & (dataset["round"] == pred_round)]
-        circuit_id = circuit_row["circuit_id"].iloc[0] if not circuit_row.empty else None
+        circuit_id = _resolve_circuit_id(dataset, pred_year, pred_round, pred_gp)
 
         try:
             race_feats = (forecast_features(pred_year, circuit_id) if stage in ("Forecast", "Post-practice")
@@ -369,31 +434,11 @@ def render_view() -> None:
             race_v1_preds = predict_race(v1_delta_pipe, v1_dnf_pipe, race_feats, v1_meta)
             race_v2_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta)
 
-        def _fmt_race_table(preds: pd.DataFrame) -> pd.DataFrame:
-            show = preds[["predicted_position", "driver", "team_id", "win_probability",
-                         "podium_probability", "points_probability"]].copy()
-            for c in ("win_probability", "podium_probability", "points_probability"):
-                show[c] = show[c] * 100
-            return show.rename(columns={"predicted_position": "Predicted", "driver": "Driver",
-                                        "team_id": "Team", "win_probability": "P(win)",
-                                        "podium_probability": "P(podium)", "points_probability": "P(points)"})
-
-        _pct_cols = {c: st.column_config.NumberColumn(format="%.1f%%") for c in ("P(win)", "P(podium)", "P(points)")}
-
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**Qualifying**")
-            q_show = quali_preds[["predicted_quali_position", "driver", "team_id", "pole_probability",
-                                  "top3_probability", "q3_probability", "expected_quali_position"]].copy()
-            for c in ("pole_probability", "top3_probability", "q3_probability"):
-                q_show[c] = q_show[c] * 100
-            q_show = q_show.rename(columns={"predicted_quali_position": "Predicted", "driver": "Driver",
-                                            "team_id": "Team", "pole_probability": "P(pole)",
-                                            "top3_probability": "P(top 3)", "q3_probability": "P(Q3)",
-                                            "expected_quali_position": "Expected pos."})
-            st.dataframe(q_show, width="stretch", hide_index=True,
-                        column_config={c: st.column_config.NumberColumn(format="%.1f%%")
-                                      for c in ("P(pole)", "P(top 3)", "P(Q3)")})
+            st.dataframe(_fmt_quali_table(quali_preds), width="stretch", hide_index=True,
+                        column_config=_QUALI_PCT_COLS)
         with col2:
             st.markdown("**Race (v1.0.0 — primary)**")
             if race_v1_preds is None:
@@ -401,12 +446,12 @@ def render_view() -> None:
                        "experimental v2 estimate below, which samples its grid from the quali model.")
             else:
                 st.dataframe(_fmt_race_table(race_v1_preds), width="stretch", hide_index=True,
-                            column_config=_pct_cols)
+                            column_config=_RACE_PCT_COLS)
                 st.caption("v1 has the better win-probability calibration on holdout (see README) -- "
                           "this is the model `predictions/{year}.csv` and `predict_next_race.py` use.")
 
         st.markdown("**Race v2 (experimental — circuit history + quali-sampled grid)**")
-        st.dataframe(_fmt_race_table(race_v2_preds), width="stretch", hide_index=True, column_config=_pct_cols)
+        st.dataframe(_fmt_race_table(race_v2_preds), width="stretch", hide_index=True, column_config=_RACE_PCT_COLS)
         if stage in ("Forecast", "Post-practice"):
             st.caption("Grid not known yet -- each of v2's 10k Monte Carlo runs samples its own simulated "
                       "qualifying order from the quali model, instead of using one fixed projection.")
@@ -567,6 +612,147 @@ def render_view() -> None:
                     brier_bits = [b for b in brier_bits if b]
                     if brier_bits:
                         st.caption("Brier (lower is better): " + ", ".join(brier_bits))
+
+    elif view == "Street circuits":
+        if not RACE_DATASET_PATH.exists():
+            st.warning("Race dataset not built yet -- run `python -m scripts.build_race_dataset`.")
+            return
+        dataset = pd.read_parquet(RACE_DATASET_PATH)
+
+        st.subheader("a. Upcoming street races")
+        labels, options, _excluded = _predictions_race_options()
+        street_upcoming = []
+        for label in labels:
+            info = options[label]
+            stage = race_stage_for(info["year"], info["name"])
+            if stage == "Result":
+                continue
+            circuit_id = _resolve_circuit_id(dataset, info["year"], info["round"], info["name"])
+            cls = classify_circuit(circuit_id)
+            if cls in ("street", "hybrid_street"):
+                street_upcoming.append({"label": label, "info": info, "stage": stage,
+                                        "circuit_id": circuit_id, "cls": cls})
+
+        if not street_upcoming:
+            st.caption("No upcoming (non-Result) street/hybrid-street races on the 2026 calendar right now.")
+        else:
+            pick_label = st.selectbox("Upcoming street race", [u["label"] for u in street_upcoming],
+                                      key="street_upcoming_race")
+            u = next(x for x in street_upcoming if x["label"] == pick_label)
+            badge = {"Forecast": "🔵 Forecast", "Post-practice": "🟡 Post-practice",
+                    "Post-quali": "🟠 Post-quali"}[u["stage"]]
+            st.markdown(f"**{u['info']['name']} {u['info']['year']} -- {u['cls'].replace('_', ' ')} -- {badge}**")
+            try:
+                race_feats = (forecast_features(u["info"]["year"], u["circuit_id"])
+                             if u["stage"] in ("Forecast", "Post-practice")
+                             else race_prediction_features(u["info"]["year"], u["info"]["name"], u["circuit_id"]))
+            except Exception as e:
+                st.error(f"Could not load data for this race: {e}")
+                race_feats = None
+            if race_feats is not None:
+                quali_pipe, quali_meta = cached_quali_models()
+                quali_preds = predict_quali(quali_pipe, race_feats, quali_meta)
+                race_delta_pipe, race_dnf_pipe, race_meta = cached_race_v2_models()
+                if u["stage"] in ("Forecast", "Post-practice"):
+                    race_preds = predict_race_v2(race_delta_pipe, race_dnf_pipe, race_feats, race_meta,
+                                                 quali_pipe=quali_pipe, quali_meta=quali_meta,
+                                                 quali_features=race_feats)
+                else:
+                    v1_delta_pipe, v1_dnf_pipe, v1_meta = cached_predictor_models()
+                    race_preds = predict_race(v1_delta_pipe, v1_dnf_pipe, race_feats, v1_meta)
+                scol1, scol2 = st.columns(2)
+                with scol1:
+                    st.markdown("**Qualifying forecast**")
+                    st.dataframe(_fmt_quali_table(quali_preds), width="stretch", hide_index=True,
+                                column_config=_QUALI_PCT_COLS)
+                with scol2:
+                    st.markdown("**Race forecast**")
+                    st.dataframe(_fmt_race_table(race_preds), width="stretch", hide_index=True,
+                                column_config=_RACE_PCT_COLS)
+
+        st.subheader("b. Street vs permanent comparison (2022-2026)")
+        metrics = street_vs_permanent_metrics(dataset)
+        st.dataframe(metrics.rename(columns={
+            "circuit_class": "Class", "n_races": "Races", "n_rows": "Rows",
+            "grid_finish_spearman": "Grid→finish Spearman", "avg_positions_gained": "Avg pos. gained",
+            "dnf_rate": "DNF rate", "pole_conversion_rate": "Pole→win rate",
+            "podium_from_top3_grid_rate": "Podium from top-3 grid",
+        }), width="stretch", hide_index=True)
+        st.caption("Grid→finish Spearman and podium-from-top-3-grid both answer \"how much does qualifying "
+                  "position matter\" -- near 1.0 means grid position is close to destiny; closer to 0 means "
+                  "there's real on-track mixing.")
+
+        sc_vsc = sc_vsc_frequency_by_class(cached_sc_vsc_flags())
+        if sc_vsc.empty:
+            st.caption("No prebuilt races with readable lap data to check for safety cars yet.")
+        else:
+            st.markdown("**Safety car / VSC frequency** (2025-2026 prebuilt races only -- 2022-2024 has no "
+                       "per-lap data in this repo, only the aggregated training set)")
+            st.dataframe(sc_vsc.rename(columns={"circuit_class": "Class", "n_races": "Races",
+                                                "sc_vsc_rate": "Share of races with a SC/VSC"}),
+                        width="stretch", hide_index=True)
+
+        st.subheader("c. Per-circuit history (last 3 editions)")
+        hist = circuit_history_table(dataset)
+        if hist.empty:
+            st.caption("No street/hybrid-street circuit history in the dataset yet.")
+        else:
+            st.dataframe(hist.rename(columns={
+                "circuit_id": "Circuit", "circuit_class": "Class", "editions": "Editions",
+                "winners": "Winners", "pole_to_win_rate": "Pole→win rate", "avg_dnfs": "Avg DNFs",
+                "top_driver": "Top driver (podiums)", "top_team": "Top team (podiums)",
+            }), width="stretch", hide_index=True)
+
+        st.subheader("d. Model accuracy by circuit class")
+        st.caption("v1 race predictor, walk-forward holdout (2025-2026), sliced by circuit class.")
+        acc = cached_model_accuracy_by_class()
+        acc_cols = st.columns(3)
+        for col, cls in zip(acc_cols, ("street", "hybrid_street", "permanent")):
+            entry = acc.get(cls, {})
+            with col:
+                st.markdown(f"**{cls.replace('_', ' ').title()}**")
+                st.caption(f"{entry.get('n_races', 0)} holdout races")
+                point_metrics = entry.get("point_metrics")
+                if point_metrics:
+                    model_mae = point_metrics.get("model", {}).get("position_mae")
+                    grid_mae = point_metrics.get("baseline_grid", {}).get("position_mae")
+                    if model_mae is not None:
+                        st.metric("Position MAE", model_mae,
+                                 delta=round(model_mae - grid_mae, 3) if grid_mae is not None else None,
+                                 delta_color="inverse")
+                if "bootstrap_ci" in entry:
+                    wb = entry["bootstrap_ci"]["win_brier_diff"]
+                    sig = "significant" if (wb["ci_low"] > 0 or wb["ci_high"] < 0) else "not significant"
+                    st.caption(f"Win Brier diff vs grid: {wb['mean_diff']} [{wb['ci_low']}, {wb['ci_high']}] ({sig})")
+                if entry.get("note"):
+                    st.info(entry["note"])
+
+        spec = frozen_model_spec()
+        if spec:
+            st.markdown(f"**Live track record by class** (since v1 froze on {spec['frozen_at']})")
+            live_acc = live_track_record_by_class(dataset, spec["frozen_at"], PREDICTIONS_DIR)
+            live_cols = st.columns(3)
+            for col, cls in zip(live_cols, ("street", "hybrid_street", "permanent")):
+                entry = live_acc.get(cls, {})
+                with col:
+                    st.caption(cls.replace("_", " ").title())
+                    if entry.get("note"):
+                        st.info(entry["note"])
+                    else:
+                        st.metric("Model MAE", entry.get("model_mae"))
+                        st.caption(f"vs grid: {entry.get('grid_mae')}")
+
+        st.subheader("e. Braking: street vs permanent")
+        braking = braking_summary_by_class(cached_braking_samples())
+        if braking.empty:
+            st.caption("No prebuilt telemetry available yet to compute braking zones.")
+        else:
+            st.dataframe(braking.rename(columns={
+                "circuit_class": "Class", "n_laps": "Laps sampled",
+                "avg_zones_per_lap": "Avg braking zones/lap", "avg_decel_g": "Avg decel (g)",
+            }), width="stretch", hide_index=True)
+            st.caption("One representative (most recent, telemetry-available) race per circuit, fastest lap "
+                      "per driver.")
 
 
 try:
