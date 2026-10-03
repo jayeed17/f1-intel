@@ -390,4 +390,41 @@ def test_compute_live_track_record(tmp_path, monkeypatch):
     assert live["n_rows_scored"] == 2
     assert live["model_mae"] == pytest.approx(0.5)
     assert live["model_winner_accuracy"] == 1.0
+
+
+def test_compute_live_track_record_ignores_staged_v2_quali_files(tmp_path, monkeypatch):
+    """Regression test: scripts/predict_staged.py logs race v2 and quali
+    predictions to {year}_race_v2_{stage}.csv / {year}_quali_{stage}.csv
+    in the SAME predictions/ directory as v1's own {year}.csv, sharing
+    many of the same column names (predicted_position, actual_position).
+    compute_live_track_record() must only ever read v1's own {year}.csv,
+    never sweep up v2/quali's files via a too-broad glob."""
+    from app.models import race_predictor as rp
+
+    predictions_dir = tmp_path / "predictions"
+    predictions_dir.mkdir()
+    monkeypatch.setattr(rp, "PREDICTIONS_DIR", predictions_dir)
+    frozen_at = "2026-06-01"
+
+    v1_rows = pd.DataFrame({
+        "predicted_at": ["2026-06-02T00:00:00+00:00"], "gp": ["V1 Only GP"], "driver": ["D0"],
+        "team_id": ["T0"], "grid": [1], "predicted_position": [1], "win_probability": [0.5],
+        "podium_probability": [0.8], "points_probability": [0.9],
+        "actual_position": [1], "scored_at": ["2026-06-03T00:00:00+00:00"],
+    })
+    v1_rows.to_csv(predictions_dir / "2026.csv", index=False)
+
+    # A DIFFERENT race, logged only by race v2's staged post-quali file --
+    # same column names as v1's file, but must not be counted as v1's own.
+    v2_rows = pd.DataFrame({
+        "predicted_at": ["2026-06-02T00:00:00+00:00"], "gp": ["V2 Only GP"], "driver": ["D1"],
+        "team_id": ["T1"], "grid": [2], "predicted_position": [2], "win_probability": [0.1],
+        "podium_probability": [0.3], "points_probability": [0.6],
+        "actual_position": [2], "scored_at": ["2026-06-03T00:00:00+00:00"],
+    })
+    v2_rows.to_csv(predictions_dir / "2026_race_v2_post_quali.csv", index=False)
+
+    live = rp.compute_live_track_record(frozen_at)
+    assert live["n_races_predicted"] == 1
+    assert live["n_races_scored"] == 1
     assert "win_brier" in live and "podium_brier" in live and "points_brier" in live

@@ -613,6 +613,36 @@ def run_full_evaluation(df: pd.DataFrame, delta_params: dict | None = None, dnf_
     return report
 
 
+def holdout_predictions_with_circuit(df: pd.DataFrame, delta_params: dict | None = None,
+                                     dnf_params: dict | None = None, min_train_races: int = 15,
+                                     n_sims: int = 10_000, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Same walk-forward + dev-fit-calibration pipeline as
+    run_full_evaluation() (byte-for-byte: same dev_df, same calibration,
+    same Monte Carlo), but returns the raw per-row HOLDOUT predictions
+    (merged with circuit_id from `df`) and the grid_prob_table, instead of
+    a summary dict -- so a caller can slice accuracy by circuit class
+    (dashboard's Street circuits view) using the exact same summarise()/
+    bootstrap_diff_ci() this module already reports with. Read-only reuse
+    of this module's own private pipeline pieces; doesn't change anything
+    run_full_evaluation() itself reports."""
+    dev_df, _ = dev_holdout_split(df)
+    grid_prob_table = empirical_grid_probs(dev_df)
+
+    preds_raw, dnf_samples_by_race = _walk_forward_raw(df, min_train_races, delta_params, dnf_params)
+    calib = _fit_dev_calibration(dev_df, delta_params, dnf_params, min_train_races, n_sims, seed)
+
+    preds = _run_monte_carlo(preds_raw, dnf_samples_by_race, calib["residual_std"],
+                             bucket_stds=calib["residual_std_by_bucket"], n_sims=n_sims, seed=seed)
+    preds["p_win"] = calib["win_calibrator"].predict(preds["p_win"])
+    preds["p_podium"] = calib["podium_calibrator"].predict(preds["p_podium"])
+    preds = _rank_and_flag(preds)
+
+    holdout_preds = preds[preds["season"] > DEV_SEASON_MAX]
+    circuit_map = df[["season", "round", "circuit_id"]].drop_duplicates()
+    holdout_preds = holdout_preds.merge(circuit_map, on=["season", "round"], how="left")
+    return holdout_preds, grid_prob_table
+
+
 # --------------------------------------------------------------------------
 # Bootstrap CIs for model-minus-baseline differences (resample races, not
 # rows -- a race is the unit of "how would a different sample of races have
@@ -938,7 +968,13 @@ def compute_live_track_record(frozen_at: str) -> dict | None:
     as "no races yet", not fabricate a metric from zero rows."""
     if not PREDICTIONS_DIR.exists():
         return None
-    frames = [pd.read_csv(p) for p in sorted(PREDICTIONS_DIR.glob("*.csv"))]
+    # Exactly "{year}.csv" (v1's own log) -- NOT "*.csv", which would also
+    # sweep up predict_staged.py's "{year}_quali_{stage}.csv" /
+    # "{year}_race_v2_{stage}.csv" files living in the same directory.
+    # Those share this exact column schema (predicted_position,
+    # actual_position, ...), so a bare "*.csv" wouldn't even error -- it
+    # would silently double-count races between v1 and v2's logs.
+    frames = [pd.read_csv(p) for p in sorted(PREDICTIONS_DIR.glob("[12][0-9][0-9][0-9].csv"))]
     frames = [f for f in frames if not f.empty]
     if not frames:
         return None

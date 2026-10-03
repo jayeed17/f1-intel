@@ -79,3 +79,26 @@ REG_CHANGE_ROUNDS = 3  # first N rounds of a reset season get the flag
 # circuitId across the layout change. 2026 Spanish GP moves from Catalunya's
 # old full layout to a reconfigured one.
 CIRCUIT_HISTORY_RESET = {"catalunya": 2026}
+
+# Street-circuit classification for the dashboard's "Street circuits" view
+# ONLY -- deliberately separate from CIRCUIT_TYPE above (street/mixed/
+# high-speed), which is a trained model feature and must not change
+# (retraining would be needed, invalidating the frozen models' meaning).
+# "street": run entirely on everyday public roads, walls/barriers
+# throughout, no permanent racing infrastructure. "hybrid_street": built on
+# closed-off roads/a purpose-laid-out lot for the race but with wide,
+# flowing, more permanent-track-like characteristics -- or (Montreal) a
+# dedicated permanent facility that still *plays* like a street circuit
+# (tight, wall-lined, unforgiving, bumpy). Anything not listed defaults to
+# "permanent" (classify_circuit() in app/analysis/street_circuits.py).
+STREET_CIRCUIT_CLASS = {
+    "monaco": "street",      # Monte Carlo public roads, barriers the entire lap, no runoff anywhere
+    "baku": "street",        # Baku City Circuit: public roads through the Old City plus a long public-road straight
+    "marina_bay": "street",  # Marina Bay: public roads around the bay, closed and lit for a night race
+    "vegas": "street",       # Las Vegas Strip Circuit: public roads (the Strip, Koval Lane), reopened to traffic after
+    "jeddah": "street",      # Jeddah Corniche Circuit: public corniche roads, walls close by despite very high average speed
+    "albert_park": "hybrid_street",  # Melbourne: public park roads, but 2021's reconfig widened/smoothed it into permanent-track-like flow
+    "miami": "hybrid_street",        # Miami: temporary circuit on closed public roads, but purpose-laid-out wide/sweeping stadium-lot loop
+    "villeneuve": "hybrid_street",   # Montreal: a dedicated permanent island facility, but tight/wall-lined/bumpy -- plays like a street track
+    "madring": "hybrid_street",      # Madring (2026 Madrid): explicitly combines a street section (IFEMA) with a purpose-built permanent section
+}

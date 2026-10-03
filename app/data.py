@@ -941,6 +941,103 @@ def race_stage_for(year: int, gp: str) -> str:
     return "Forecast"
 
 
+def prebuilt_sc_vsc_flags() -> pd.DataFrame:
+    """One row per built Race session with a readable laps.parquet:
+    season, round, circuit_id, had_sc_or_vsc. FastF1 concatenates every
+    status code that occurred during a lap into one TrackStatus string
+    (e.g. "412"); '4' = Safety Car, '6'/'7' = VSC deployed/ending, so a
+    lap's string containing any of those three digits means a SC or VSC
+    period touched that lap. Only ever reads data/prebuilt/ (laps.parquet)
+    and data/model/race_dataset.parquet (for the circuit_id join) --
+    never FastF1/OpenF1 -- so this is safe to call on Streamlit Cloud.
+    Best-effort: a race whose laps.parquet is missing/unreadable, or
+    whose circuit_id can't be resolved, is skipped rather than failing
+    the whole scan. Only covers whatever's actually in data/prebuilt/
+    (2025 + completed 2026 races) -- 2022-2024 has no per-lap TrackStatus
+    anywhere in this repo, only the aggregated training dataset."""
+    empty = pd.DataFrame(columns=["season", "round", "circuit_id", "had_sc_or_vsc"])
+    if not RACE_DATASET_PATH.exists():
+        return empty
+    circuit_map = pd.read_parquet(RACE_DATASET_PATH, columns=["season", "round", "circuit_id"]).drop_duplicates()
+
+    rows = []
+    for r in prebuilt_races():
+        if "R" not in r.get("sessions", []):
+            continue
+        path = PREBUILT_DIR / str(r["year"]) / str(r["round"]) / "R" / "laps.parquet"
+        if not path.exists():
+            continue
+        try:
+            laps = pd.read_parquet(path, columns=["TrackStatus"])
+        except Exception:  # noqa: BLE001 -- best-effort scan, one bad file shouldn't kill the rest
+            continue
+        status = laps["TrackStatus"].dropna().astype(str)
+        had_sc_vsc = bool(status.str.contains("4|6|7", regex=True).any())
+        rows.append({"season": r["year"], "round": r["round"], "had_sc_or_vsc": had_sc_vsc})
+
+    if not rows:
+        return empty
+    flags = pd.DataFrame(rows)
+    return flags.merge(circuit_map, on=["season", "round"], how="left").dropna(subset=["circuit_id"])
+
+
+def prebuilt_braking_samples() -> pd.DataFrame:
+    """One row per driver's fastest Race-session lap, for ONE
+    representative race per circuit (the most recent prebuilt edition
+    whose R session actually has telemetry, not a degraded/laps-only
+    source) -- not every edition, to keep the number of telemetry file
+    reads bounded: season, round, circuit_id, driver, n_zones (braking
+    zones found via app.analysis.braking.braking_zones on that lap),
+    avg_decel_g. Only ever reads data/prebuilt/ and data/model/
+    race_dataset.parquet -- never FastF1/OpenF1 -- so this is safe to
+    call on Streamlit Cloud. Best-effort throughout: a race/driver whose
+    telemetry can't be loaded is skipped, not a hard failure. Can be slow
+    (reads real per-driver telemetry files) -- callers should cache this."""
+    from app.analysis.braking import braking_zones
+
+    empty = pd.DataFrame(columns=["season", "round", "circuit_id", "driver", "n_zones", "avg_decel_g"])
+    if not RACE_DATASET_PATH.exists():
+        return empty
+    circuit_map = pd.read_parquet(RACE_DATASET_PATH, columns=["season", "round", "circuit_id"]).drop_duplicates()
+    cmap = {(int(s), int(rd)): cid for s, rd, cid in circuit_map.itertuples(index=False)}
+
+    # prebuilt_races() is newest-first, so the first telemetry-eligible
+    # race seen per circuit_id is automatically the most recent one.
+    chosen: dict[str, dict] = {}
+    for r in prebuilt_races():
+        if "R" not in r.get("sessions", []):
+            continue
+        if "telemetry" in session_missing(r["year"], r["name"], "R"):
+            continue
+        cid = cmap.get((r["year"], r["round"]))
+        if cid is None or cid in chosen:
+            continue
+        chosen[cid] = r
+
+    rows = []
+    for cid, r in chosen.items():
+        try:
+            s = PrebuiltSession(r["year"], r["round"], "R")
+        except Exception:  # noqa: BLE001 -- best-effort scan
+            continue
+        drivers = sorted(s.laps["Driver"].dropna().unique()) if "Driver" in s.laps else []
+        for drv in drivers:
+            try:
+                lap = get_lap(s, drv, "fastest")
+                tel = lap_telemetry(lap)
+            except Exception:  # noqa: BLE001
+                continue
+            zones = braking_zones(tel)
+            if zones.empty:
+                continue
+            rows.append({
+                "season": r["year"], "round": r["round"], "circuit_id": cid, "driver": drv,
+                "n_zones": len(zones),
+                "avg_decel_g": float(zones["avg_decel_g"].dropna().mean()) if zones["avg_decel_g"].notna().any() else None,
+            })
+    return pd.DataFrame(rows) if rows else empty
+
+
 def predictions_race_options(year: int = 2026) -> tuple[list[dict], list[str]]:
     """Every `year` race for the dashboard's Predictions dropdown -- not
     just the next one. Built (prebuilt-bundle) rounds come first, in
