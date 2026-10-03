@@ -509,12 +509,13 @@
       "round": 1,
       "name": "Australian Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -522,6 +523,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -533,25 +539,33 @@
       "round": 2,
       "name": "Chinese Grand Prix",
       "sessions": [
+        "FP1",
         "Q",
         "R",
         "S",
         "SQ"
       ],
-      "built_at": "2026-09-26T04:44:50.147369+00:00",
-      "session_status": {}
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      }
     },
     {
       "year": 2026,
       "round": 3,
       "name": "Japanese Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -559,6 +573,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -570,38 +589,53 @@
       "round": 4,
       "name": "Miami Grand Prix",
       "sessions": [
+        "FP1",
         "Q",
         "R",
         "S",
         "SQ"
       ],
-      "built_at": "2026-09-26T04:44:50.147369+00:00",
-      "session_status": {}
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      }
     },
     {
       "year": 2026,
       "round": 5,
       "name": "Canadian Grand Prix",
       "sessions": [
+        "FP1",
         "Q",
         "R",
         "S",
         "SQ"
       ],
-      "built_at": "2026-09-26T04:44:50.147369+00:00",
-      "session_status": {}
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      }
     },
     {
       "year": 2026,
       "round": 6,
       "name": "Monaco Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -609,6 +643,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -620,12 +659,13 @@
       "round": 7,
       "name": "Barcelona Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -633,6 +673,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -644,12 +689,13 @@
       "round": 8,
       "name": "Austrian Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -657,6 +703,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -668,25 +719,33 @@
       "round": 9,
       "name": "British Grand Prix",
       "sessions": [
+        "FP1",
         "Q",
         "R",
         "S",
         "SQ"
       ],
-      "built_at": "2026-09-26T04:44:50.147369+00:00",
-      "session_status": {}
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      }
     },
     {
       "year": 2026,
       "round": 10,
       "name": "Belgian Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -694,6 +753,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -705,12 +769,13 @@
       "round": 11,
       "name": "Hungarian Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -718,6 +783,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -729,25 +799,33 @@
       "round": 12,
       "name": "Dutch Grand Prix",
       "sessions": [
+        "FP1",
         "Q",
         "R",
         "S",
         "SQ"
       ],
-      "built_at": "2026-09-26T04:44:50.147369+00:00",
-      "session_status": {}
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      }
     },
     {
       "year": 2026,
       "round": 13,
       "name": "Italian Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "FP2": {
           "source": "fastf1",
@@ -755,6 +833,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -766,12 +849,13 @@
       "round": 14,
       "name": "Spanish Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
         "R"
       ],
-      "built_at": "2026-10-01T05:11:54.679281+00:00",
+      "built_at": "2026-10-03T13:08:37.948825+00:00",
       "session_status": {
         "Q": {
           "source": "fastf1",
@@ -784,6 +868,11 @@
           "missing": []
         },
         "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP1": {
           "source": "fastf1",
           "status": "complete",
           "missing": []
@@ -795,6 +884,7 @@
       "round": 15,
       "name": "Azerbaijan Grand Prix",
       "sessions": [
+        "FP1",
         "FP2",
         "FP3",
         "Q",
@@ -802,20 +892,14 @@
       ],
       "session_status": {
         "Q": {
-          "source": "openf1",
-          "status": "partial",
-          "missing": [
-            "telemetry",
-            "corners"
-          ]
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
         },
         "R": {
-          "source": "openf1",
-          "status": "partial",
-          "missing": [
-            "telemetry",
-            "corners"
-          ]
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
         },
         "FP2": {
           "source": "fastf1",
@@ -826,9 +910,14 @@
           "source": "fastf1",
           "status": "complete",
           "missing": []
+        },
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
         }
       },
-      "built_at": "2026-10-01T05:11:54.679281+00:00"
+      "built_at": "2026-10-03T13:08:37.948825+00:00"
     }
   ]
 }
