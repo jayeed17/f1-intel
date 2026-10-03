@@ -19,7 +19,95 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  update:
+  # Tried first: a self-hosted Mac that can actually reach F1's live timing
+  # API (GitHub's hosted ubuntu-latest runners can't -- see update-fallback
+  # below). If no self-hosted runner with the "macOS" label is online, this
+  # job sits queued -- GitHub auto-fails a job queued for more than 24h, at
+  # which point update-fallback runs. That's GitHub's own hard limit, not
+  # something this workflow controls; for a faster failover than "up to 24h"
+  # while the Mac is known to be offline, just run update-fallback manually
+  # via workflow_dispatch in the meantime. timeout-minutes below only bounds
+  # a run that DID start (e.g. the Mac is on but something hangs), not the
+  # queued-and-waiting-for-a-runner phase.
+  update-self-hosted:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FastF1 data
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: fastf1-cache-${{ github.run_id }}
+          restore-keys: |
+            fastf1-cache-
+
+      - name: Set up pinned venv (refuses to run on a conda/anaconda Python)
+        run: |
+          rm -rf .venv
+          python3 -m venv .venv
+          RESOLVED="$(.venv/bin/python -c 'import sys; print(sys.executable)')"
+          echo "Using interpreter: $RESOLVED"
+          case "$RESOLVED" in
+            *anaconda*|*miniconda*|*/conda/*|*condabin*)
+              echo "::error::Resolved to a conda Python ($RESOLVED) -- refusing to run. Fix the runner's PATH (see .env in the runner's install directory) so python3 resolves to a plain/python.org interpreter, not anaconda." >&2
+              exit 1
+              ;;
+          esac
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+
+      - name: Build missing prebuilt data
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        run: .venv/bin/python -m scripts.build_prebuilt --year 2026 --only-missing
+
+      - name: Score predictions
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        run: |
+          .venv/bin/python -m scripts.score_predictions --year 2026
+          .venv/bin/python -m scripts.score_staged --year 2026
+
+      - name: Forecast next race (quali + race v2, pre-weekend)
+        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        run: .venv/bin/python -m scripts.predict_staged --stage forecast
+
+      - name: Post-practice forecast (quali + race v2, after FP3)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 16 * * 6'
+        run: .venv/bin/python -m scripts.predict_staged --stage post_practice
+
+      - name: Predict next race (v1, post-quali)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        run: .venv/bin/python -m scripts.predict_next_race
+
+      - name: Post-quali race predictions (v2)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        run: .venv/bin/python -m scripts.predict_staged --stage post_quali
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/prebuilt predictions
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "Update prebuilt race data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            git push
+          fi
+
+  # Only runs if update-self-hosted didn't finish successfully (Mac offline,
+  # runner crashed, a step failed, etc). GitHub's hosted runners can't reach
+  # F1's live timing API at all, so this relies entirely on the OpenF1
+  # fallback already built into scripts/build_prebuilt.py -- sessions built
+  # this way often land "partial" (laps/results only, see
+  # session_status.missing in manifest.json) until the self-hosted Mac picks
+  # them up later, or scripts/complete_partials.sh is run by hand.
+  update-fallback:
+    needs: update-self-hosted
+    if: ${{ always() && needs.update-self-hosted.result != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
