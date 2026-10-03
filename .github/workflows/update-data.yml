@@ -30,6 +30,13 @@ jobs:
   # a run that DID start (e.g. the Mac is on but something hangs), not the
   # queued-and-waiting-for-a-runner phase.
   update-self-hosted:
+    # Second, independent guard on top of this workflow's own trigger list
+    # (schedule + workflow_dispatch only, neither outsider-triggerable) --
+    # belt-and-suspenders against a future edit that adds a pull_request-
+    # style trigger without noticing it'd also expose this self-hosted job.
+    # See CLAUDE.md's "Security" note: never add pull_request to this
+    # workflow's `on:` block while a self-hosted job exists in it.
+    if: github.repository == 'jayeed17/f1-intel' && github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     permissions:
