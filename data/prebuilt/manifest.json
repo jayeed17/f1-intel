@@ -918,6 +918,46 @@
         }
       },
       "built_at": "2026-10-03T13:08:37.948825+00:00"
+    },
+    {
+      "year": 2026,
+      "round": 16,
+      "name": "Bahrain Grand Prix",
+      "sessions": [
+        "FP1",
+        "FP2",
+        "FP3",
+        "Q",
+        "R"
+      ],
+      "session_status": {
+        "FP1": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP2": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP3": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "Q": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        },
+        "R": {
+          "source": "fastf1",
+          "status": "complete",
+          "missing": []
+        }
+      },
+      "built_at": "2026-10-05T21:22:14.141282+00:00"
     }
   ]
 }
