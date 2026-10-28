@@ -367,8 +367,8 @@ def test_openf1_session_maps_to_expected_shapes(monkeypatch):
     def fake_openf1_get(path, timeout=10, **params):
         if path == "sessions":
             return [{"session_key": 9999, "date_start": "2026-01-01T13:00:00+00:00",
-                     "location": "Testville", "circuit_short_name": "testville",
-                     "country_name": "Testland", "session_name": "Race"}]
+                     "location": "Testland City", "circuit_short_name": "testland",
+                     "country_name": "Testlandia", "session_name": "Race", "meeting_key": 1}]
         if path == "drivers":
             return [{"driver_number": 1, "name_acronym": "VER", "full_name": "Max Verstappen",
                      "team_name": "Red Bull Racing"},
@@ -420,6 +420,78 @@ def test_openf1_session_maps_to_expected_shapes(monkeypatch):
     assert bool(tel["Brake"].iloc[-1]) is True
     assert tel["Distance"].is_monotonic_increasing
     assert tel["X"].iloc[1] == 10.0
+
+
+def test_openf1_find_session_does_not_confuse_same_country_races(monkeypatch):
+    """Miami, United States GP (COTA), and Las Vegas are all country_name ==
+    "United States" -- matching on bare country_name used to make every
+    "United States Grand Prix" (COTA) lookup silently resolve to whichever
+    US race is furthest in the future (Las Vegas) instead of COTA itself.
+    Each of the three must resolve to its own real meeting_key."""
+    from app import data as data_mod
+
+    sessions = [
+        {"session_key": 1, "date_start": "2026-05-02T20:00:00+00:00", "location": "Miami Gardens",
+         "circuit_short_name": "Miami", "country_name": "United States", "meeting_key": 1284},
+        {"session_key": 2, "date_start": "2026-10-24T21:00:00+00:00", "location": "Austin",
+         "circuit_short_name": "Austin", "country_name": "United States", "meeting_key": 1297},
+        {"session_key": 3, "date_start": "2026-11-21T02:00:00+00:00", "location": "Las Vegas",
+         "circuit_short_name": "Las Vegas", "country_name": "United States", "meeting_key": 1300},
+    ]
+    meetings = [
+        {"meeting_key": 1284, "meeting_name": "Miami Grand Prix"},
+        {"meeting_key": 1297, "meeting_name": "United States Grand Prix"},
+        {"meeting_key": 1300, "meeting_name": "Las Vegas Grand Prix"},
+    ]
+
+    def fake_openf1_get(path, timeout=10, **params):
+        if path == "sessions":
+            return sessions
+        if path == "meetings":
+            return meetings
+        raise AssertionError(f"unexpected OpenF1 path {path!r}")
+
+    monkeypatch.setattr(data_mod, "_openf1_get", fake_openf1_get)
+
+    assert data_mod._openf1_find_session(2026, "Miami Grand Prix", "Q")["meeting_key"] == 1284
+    assert data_mod._openf1_find_session(2026, "United States Grand Prix", "Q")["meeting_key"] == 1297
+    assert data_mod._openf1_find_session(2026, "Las Vegas Grand Prix", "Q")["meeting_key"] == 1300
+
+
+def test_openf1_find_session_breaks_ties_by_nearest_date(monkeypatch):
+    """A cancelled-and-rescheduled race can appear twice in OpenF1 under the
+    same name (two different meeting_keys). Once name-matching narrows to
+    both, the nearest-to-FastF1's-own-schedule-date meeting must win, not
+    the chronologically latest one."""
+    from app import data as data_mod
+
+    sessions = [
+        {"session_key": 1, "date_start": "2026-04-01T12:00:00+00:00", "location": "Sakhir",
+         "circuit_short_name": "Sakhir", "country_name": "Bahrain", "meeting_key": 1},
+        {"session_key": 2, "date_start": "2026-10-02T04:30:00+00:00", "location": "Sakhir",
+         "circuit_short_name": "Sakhir", "country_name": "Bahrain", "meeting_key": 2},
+    ]
+
+    meetings = [
+        {"meeting_key": 1, "meeting_name": "Bahrain Grand Prix"},
+        {"meeting_key": 2, "meeting_name": "Bahrain Grand Prix"},
+    ]
+
+    def fake_openf1_get(path, timeout=10, **params):
+        if path == "sessions":
+            return sessions
+        if path == "meetings":
+            return meetings
+        raise AssertionError(f"unexpected OpenF1 path {path!r}")
+
+    sch = pd.DataFrame({"EventName": ["Bahrain Grand Prix"], "RoundNumber": [8],
+                        "EventDate": [pd.Timestamp("2026-10-02T04:30:00Z")]})
+
+    monkeypatch.setattr(data_mod, "_openf1_get", fake_openf1_get)
+    monkeypatch.setattr(data_mod.fastf1, "get_event_schedule", lambda year, include_testing: sch)
+
+    result = data_mod._openf1_find_session(2026, "Bahrain Grand Prix", "R")
+    assert result["meeting_key"] == 2  # Oct date, not the earlier cancelled April one
 
 
 def test_get_session_source_order(monkeypatch):

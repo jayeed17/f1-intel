@@ -185,7 +185,41 @@ def _openf1_get(path: str, timeout: float = 10, **params) -> list[dict]:
         raise OpenF1Error(str(e)) from e
 
 
+def _fastf1_event_date(year: int, gp: str | int) -> pd.Timestamp | None:
+    """Best-effort: this event's scheduled date from FastF1's own schedule.
+    Used only to break a remaining tie between OpenF1 meetings that still
+    collide after name matching (e.g. a cancelled-and-rescheduled race
+    appearing twice under the same name). None if the schedule can't be
+    fetched or no row matches -- callers must fall back to their own
+    pre-this-fix behaviour in that case, not crash."""
+    try:
+        sch = fastf1.get_event_schedule(year, include_testing=False)
+    except Exception:
+        return None
+    if isinstance(gp, str) and not gp.isdigit():
+        rows = sch[sch["EventName"].str.lower() == gp.lower()]
+    else:
+        rows = sch[sch["RoundNumber"] == int(gp)]
+    if rows.empty:
+        return None
+    d = pd.Timestamp(rows.iloc[0]["EventDate"])
+    return d.tz_localize("UTC") if d.tzinfo is None else d.tz_convert("UTC")
+
+
 def _openf1_find_session(year: int, gp: str | int, session: str) -> dict:
+    """Resolve an OpenF1 session_key for (year, gp, session).
+
+    Matches on location/circuit_short_name (and, failing that, OpenF1's own
+    meeting_name via /meetings) -- never on bare country_name. Multiple Grand
+    Prix weekends share a country (Miami, Austin/COTA, and Las Vegas are all
+    "United States"), so matching country_name alone silently resolves to
+    whichever US race is furthest in the future rather than the one actually
+    requested -- confirmed live: a "United States Grand Prix" (COTA) lookup
+    was resolving to Las Vegas's session_keys. If more than one OpenF1
+    meeting still matches after name filtering (e.g. a cancelled-and-
+    rescheduled race listed twice), pick the one whose date is closest to
+    this event's date per FastF1's own schedule, not just the latest.
+    """
     name = _OPENF1_SESSION_NAME.get(session, session)
     rows = _openf1_get("sessions", year=year, session_name=name)
     if not rows:
@@ -196,10 +230,25 @@ def _openf1_find_session(year: int, gp: str | int, session: str) -> dict:
             r for r in rows
             if needle in (r.get("location") or "").lower()
             or needle in (r.get("circuit_short_name") or "").lower()
-            or needle in (r.get("country_name") or "").lower()
         ]
+        if not matches:
+            # location/circuit_short_name don't always share wording with the
+            # GP name (e.g. "United States Grand Prix" vs circuit "Austin") --
+            # cross-reference OpenF1's own meeting_name via /meetings instead
+            # of ever falling back to country_name.
+            meetings = _openf1_get("meetings", year=year)
+            meeting_keys = {
+                m["meeting_key"] for m in meetings
+                if needle in (m.get("meeting_name") or "").lower()
+            }
+            matches = [r for r in rows if r.get("meeting_key") in meeting_keys]
         if matches:
             rows = matches
+    if len({r.get("meeting_key") for r in rows}) > 1:
+        target_date = _fastf1_event_date(year, gp)
+        if target_date is not None:
+            rows = sorted(rows, key=lambda r: abs((pd.Timestamp(r["date_start"]) - target_date).total_seconds()))
+            return rows[0]
     rows.sort(key=lambda r: r.get("date_start") or "")
     return rows[-1]
 
