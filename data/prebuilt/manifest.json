@@ -918,6 +918,25 @@
         }
       },
       "built_at": "2026-10-03T13:08:37.948825+00:00"
+    },
+    {
+      "year": 2026,
+      "round": 18,
+      "name": "United States Grand Prix",
+      "sessions": [
+        "R"
+      ],
+      "session_status": {
+        "R": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        }
+      },
+      "built_at": "2026-11-06T08:37:00.706916+00:00"
     }
   ]
 }
