@@ -920,6 +920,92 @@ def _quali_rolling_snapshot_for_prediction(dataset: pd.DataFrame, driver: str, t
     }
 
 
+# --------------------------------------------------------------------------
+# Scheduling gates for staged predictions (scripts/predict_next_race.py,
+# scripts/predict_staged.py). These run on an hourly cron across race
+# weekends rather than at one fixed UTC time -- a fixed time ("Saturday
+# 20:00 UTC -- qualifying has finished for essentially every race format by
+# then") broke for the 2026 United States GP (COTA), whose Qualifying runs
+# 21:00-22:00 UTC, two hours later than most European-weekend races. These
+# helpers let each hourly tick decide for itself whether the session it
+# cares about has actually finished, rather than assuming a fixed offset.
+# --------------------------------------------------------------------------
+
+_SESSION_DURATION_MIN = {
+    "Practice 1": 90, "Practice 2": 90, "Practice 3": 90,
+    "Sprint Qualifying": 45, "Qualifying": 60, "Sprint": 60, "Race": 150,
+}
+
+
+def _event_schedule_row(year: int, gp: str) -> pd.Series | None:
+    """This event's row from FastF1's own schedule (has Session{1..5}Name /
+    Session{1..5}DateUtc columns). None if the schedule can't be fetched or
+    gp doesn't match any row -- callers must treat that as "can't tell",
+    not "nothing scheduled"."""
+    try:
+        sch = fastf1.get_event_schedule(year, include_testing=False)
+    except Exception:
+        return None
+    rows = sch[sch["EventName"].str.lower() == gp.lower()]
+    return rows.iloc[0] if not rows.empty else None
+
+
+def _latest_started_session(row: pd.Series, session_names: tuple[str, ...],
+                            now: pd.Timestamp) -> tuple[pd.Timestamp, str] | None:
+    """The latest-dated (start, name) among this event's sessions whose name
+    is in `session_names` and that has already started as of `now`. None if
+    no such session exists yet."""
+    starts = []
+    for i in range(1, 6):
+        s_name = row.get(f"Session{i}")
+        if s_name not in session_names:
+            continue
+        d = row.get(f"Session{i}DateUtc")
+        if pd.isna(d):
+            continue
+        d = pd.Timestamp(d)
+        d = d.tz_localize("UTC") if d.tzinfo is None else d.tz_convert("UTC")
+        if d <= now:
+            starts.append((d, s_name))
+    if not starts:
+        return None
+    starts.sort()
+    return starts[-1]
+
+
+def session_readiness(now: pd.Timestamp, year: int, gp: str, session_names: tuple[str, ...],
+                      buffer: pd.Timedelta) -> tuple[bool, str]:
+    """True if the latest of `session_names` for (year, gp) started and its
+    estimated end (start + a per-session-type duration from
+    _SESSION_DURATION_MIN -- FastF1's schedule only carries start times) is
+    at least `buffer` in the past. A conservative (long) duration estimate
+    is fine here: this is checked on an hourly cron, so underestimating
+    readiness by an hour just means waiting one more tick, not missing the
+    window the way a single fixed-time cron could."""
+    row = _event_schedule_row(year, gp)
+    if row is None:
+        return False, f"{gp} ({year}) not found on the schedule"
+    found = _latest_started_session(row, session_names, now)
+    if found is None:
+        return False, f"no {'/'.join(session_names)} session for {gp} has started yet"
+    start, name = found
+    end = start + pd.Timedelta(minutes=_SESSION_DURATION_MIN.get(name, 90))
+    if now - end < buffer:
+        return False, f"{name} for {gp} probably hasn't ended + a {buffer} buffer yet"
+    return True, "ready"
+
+
+def race_has_started(now: pd.Timestamp, year: int, gp: str) -> bool:
+    """True if this event's Race session has started -- OR if the schedule
+    can't be checked at all. Fails safe toward "assume started" so a
+    transient schedule-fetch hiccup can never cause a late, backfilled
+    prediction after the race is already underway."""
+    row = _event_schedule_row(year, gp)
+    if row is None:
+        return True
+    return _latest_started_session(row, ("Race",), now) is not None
+
+
 def race_prediction_features(year: int, gp: str, circuit_id: str | None = None) -> pd.DataFrame:
     """Pre-race feature row per driver for an upcoming race's qualifying
     session (post-qualifying: grid/quali_position are real), in the shape

@@ -50,6 +50,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from app.config import FROZEN_MODEL_DIR, MODEL_DIR, PREDICTIONS_DIR
+from app.predictions_log import missed_records_since
 
 # --------------------------------------------------------------------------
 # Feature sets. Two separate models -- the finisher delta regressor gets the
@@ -962,12 +963,20 @@ def predict_race(delta_pipe, dnf_pipe, race_features: pd.DataFrame, meta: dict,
 
 def compute_live_track_record(frozen_at: str) -> dict | None:
     """Reads every predictions/{year}.csv, keeps rows predicted at/after
-    frozen_at, and scores the ones with a real result in yet. Returns None
-    if nothing has been predicted since the freeze yet (a fresh freeze, or
-    before the next scheduled prediction run) -- callers should render that
-    as "no races yet", not fabricate a metric from zero rows."""
+    frozen_at, and scores the ones with a real result in yet. Also mixes in
+    any races the pipeline ever failed to predict at all since frozen_at
+    (app.predictions_log.missed_records_since -- e.g. the 2026 US GP, whose
+    Qualifying ended after the old fixed-time cron had already fired) as a
+    "missed" list, so the live track record is honest about a gap instead
+    of silently omitting that race or (worse) backfilling a prediction for
+    it after the fact. Returns None only if there's truly nothing to
+    report -- no live predictions AND no missed races -- since the freeze
+    (a fresh freeze, or before the next scheduled prediction run);
+    callers should render that as "no races yet", not fabricate a metric
+    from zero rows."""
+    missed = missed_records_since("race_v1", "post_quali", frozen_at, predictions_dir=PREDICTIONS_DIR)
     if not PREDICTIONS_DIR.exists():
-        return None
+        return {"frozen_at": frozen_at, "n_races_predicted": 0, "missed": missed} if missed else None
     # Exactly "{year}.csv" (v1's own log) -- NOT "*.csv", which would also
     # sweep up predict_staged.py's "{year}_quali_{stage}.csv" /
     # "{year}_race_v2_{stage}.csv" files living in the same directory.
@@ -977,7 +986,7 @@ def compute_live_track_record(frozen_at: str) -> dict | None:
     frames = [pd.read_csv(p) for p in sorted(PREDICTIONS_DIR.glob("[12][0-9][0-9][0-9].csv"))]
     frames = [f for f in frames if not f.empty]
     if not frames:
-        return None
+        return {"frozen_at": frozen_at, "n_races_predicted": 0, "missed": missed} if missed else None
 
     all_preds = pd.concat(frames, ignore_index=True)
     all_preds["predicted_at"] = pd.to_datetime(all_preds["predicted_at"], utc=True)
@@ -985,9 +994,9 @@ def compute_live_track_record(frozen_at: str) -> dict | None:
     cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
     live = all_preds[all_preds["predicted_at"] >= cutoff]
     if live.empty:
-        return None
+        return {"frozen_at": frozen_at, "n_races_predicted": 0, "missed": missed} if missed else None
 
-    out = {"frozen_at": frozen_at, "n_races_predicted": int(live["gp"].nunique())}
+    out = {"frozen_at": frozen_at, "n_races_predicted": int(live["gp"].nunique()), "missed": missed}
     scored = live.dropna(subset=["actual_position"])
     out["n_races_scored"] = int(scored["gp"].nunique())
     out["n_rows_scored"] = int(len(scored))

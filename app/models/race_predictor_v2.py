@@ -50,6 +50,7 @@ from sklearn.preprocessing import OneHotEncoder
 
 from app.config import FROZEN_MODEL_DIR, MODEL_DIR, PREDICTIONS_DIR
 from app.models import race_predictor as v1
+from app.predictions_log import missed_records_since
 
 # --------------------------------------------------------------------------
 # Position ("delta") model features: v1's feature set plus circuit history.
@@ -667,13 +668,19 @@ def compute_live_track_record(frozen_at: str, stage: str) -> dict | None:
     pre-race value rather than NaN) and, paired by (gp, driver), against
     v1's own prediction for the same race from predictions/{year}.csv --
     v1 only ever predicts post-quali, so this comparison is also only
-    populated at that stage. None if nothing's been predicted at this
-    stage since the freeze yet."""
+    populated at that stage. Also mixes in any races this stage ever
+    failed to predict at all since frozen_at
+    (app.predictions_log.missed_records_since) as a "missed" list, so a
+    pipeline failure shows up honestly instead of being silently omitted
+    or backfilled after the race. None only if there's truly nothing to
+    report -- no live predictions AND no missed races -- since the
+    freeze."""
+    missed = missed_records_since("race_v2", stage, frozen_at, predictions_dir=PREDICTIONS_DIR)
     files = sorted(PREDICTIONS_DIR.glob(f"*_race_v2_{stage}.csv")) if PREDICTIONS_DIR.exists() else []
     frames = [pd.read_csv(p) for p in files]
     frames = [f for f in frames if not f.empty]
     if not frames:
-        return None
+        return {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": 0, "missed": missed} if missed else None
 
     all_preds = pd.concat(frames, ignore_index=True)
     all_preds["predicted_at"] = pd.to_datetime(all_preds["predicted_at"], utc=True)
@@ -681,9 +688,9 @@ def compute_live_track_record(frozen_at: str, stage: str) -> dict | None:
     cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
     live = all_preds[all_preds["predicted_at"] >= cutoff]
     if live.empty:
-        return None
+        return {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": 0, "missed": missed} if missed else None
 
-    out = {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": int(live["gp"].nunique())}
+    out = {"frozen_at": frozen_at, "stage": stage, "n_races_predicted": int(live["gp"].nunique()), "missed": missed}
     scored = live.dropna(subset=["actual_position"])
     out["n_races_scored"] = int(scored["gp"].nunique())
     out["n_rows_scored"] = int(len(scored))

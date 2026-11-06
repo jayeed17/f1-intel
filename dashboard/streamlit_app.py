@@ -167,6 +167,17 @@ def _default_predictions_index(options: dict[str, dict]) -> int:
     return max(len(labels) - 1, 0)
 
 
+def _render_missed_predictions(missed: list[dict]) -> None:
+    """Races a model's live track record genuinely failed to predict at
+    all (app.predictions_log.log_missed_prediction, e.g. the 2026 US GP's
+    COTA-timed Qualifying missing the old fixed-time cron) -- shown
+    honestly instead of silently omitted or backfilled after the fact."""
+    if not missed:
+        return
+    names = ", ".join(m["gp"] for m in missed)
+    st.warning(f"Missed (pipeline failure, not backfilled): {names}")
+
+
 @st.cache_resource(show_spinner="Training qualifying predictor...")
 def cached_quali_models():
     return ensure_trained_quali(RACE_DATASET_PATH)
@@ -500,7 +511,9 @@ def render_view() -> None:
                         st.caption(qlabel)
                         if live_q is None:
                             st.info("No predictions logged yet at this stage since the freeze.")
-                        elif live_q["n_races_scored"] == 0:
+                            continue
+                        _render_missed_predictions(live_q.get("missed", []))
+                        if live_q["n_races_scored"] == 0:
                             st.info(f"{live_q['n_races_predicted']} race(s) predicted, none scored yet.")
                         else:
                             st.metric("Model MAE", live_q["model_mae"])
@@ -523,7 +536,9 @@ def render_view() -> None:
                         st.caption(rlabel)
                         if live_v2 is None:
                             st.info("No predictions logged yet at this stage since v2's freeze.")
-                        elif live_v2["n_races_scored"] == 0:
+                            continue
+                        _render_missed_predictions(live_v2.get("missed", []))
+                        if live_v2["n_races_scored"] == 0:
                             st.info(f"{live_v2['n_races_predicted']} race(s) predicted, none scored yet.")
                         else:
                             st.metric("v2 MAE", live_v2["model_mae"])
@@ -596,9 +611,11 @@ def render_view() -> None:
                     st.info("No races predicted since the freeze yet -- this fills in as the weekly "
                            "Action logs and scores predictions going forward.")
                 elif live["n_races_scored"] == 0:
+                    _render_missed_predictions(live.get("missed", []))
                     st.info(f"{live['n_races_predicted']} race(s) predicted since the freeze, "
                            "none scored yet (race hasn't happened / results not in yet).")
                 else:
+                    _render_missed_predictions(live.get("missed", []))
                     lcols = st.columns(4)
                     lcols[0].metric("Races scored", live["n_races_scored"])
                     lcols[1].metric("Model MAE", live["model_mae"],

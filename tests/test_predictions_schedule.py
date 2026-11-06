@@ -10,7 +10,7 @@ race_options() must return every remaining round on the calendar."""
 import pandas as pd
 
 import app.data as data_mod
-from app.data import is_event_cancelled, predictions_race_options
+from app.data import is_event_cancelled, predictions_race_options, race_has_started, session_readiness
 
 
 def _fake_schedule(rows: list[dict]) -> pd.DataFrame:
@@ -82,3 +82,66 @@ def test_schedule_fetch_failure_degrades_to_built_rounds_only(monkeypatch):
     races, excluded = predictions_race_options(2026)
     assert [r["name"] for r in races] == ["Australian Grand Prix"]
     assert excluded == []
+
+
+def _cota_like_schedule_row() -> pd.Series:
+    """The 2026 US GP's real session timing (Qualifying 21:00-22:00 UTC,
+    Race 20:00-22:00 UTC the next day) -- two hours later than most
+    European-weekend races, which is why the old fixed "0 20 * * 6" cron
+    missed it."""
+    return pd.Series({
+        "EventName": "United States Grand Prix",
+        "Session1": "Practice 1", "Session1DateUtc": pd.Timestamp("2026-10-23T17:30:00Z"),
+        "Session2": "Practice 2", "Session2DateUtc": pd.Timestamp("2026-10-23T21:00:00Z"),
+        "Session3": "Practice 3", "Session3DateUtc": pd.Timestamp("2026-10-24T17:30:00Z"),
+        "Session4": "Qualifying", "Session4DateUtc": pd.Timestamp("2026-10-24T21:00:00Z"),
+        "Session5": "Race", "Session5DateUtc": pd.Timestamp("2026-10-25T20:00:00Z"),
+    })
+
+
+def test_session_readiness_false_before_the_buffer_elapses(monkeypatch):
+    """This is exactly the 2026 US GP scenario: Qualifying started at
+    21:00 UTC, so a cron firing at 22:13 UTC (13 minutes after the
+    schedule's listed end, and well under the 90-minute buffer) must not
+    be considered ready yet."""
+    monkeypatch.setattr(data_mod.fastf1, "get_event_schedule",
+                        lambda year, include_testing: pd.DataFrame([_cota_like_schedule_row()]))
+    now = pd.Timestamp("2026-10-24T22:13:00Z")  # 13 min after quali's listed end
+    ready, reason = session_readiness(now, 2026, "United States Grand Prix", ("Qualifying",),
+                                       pd.Timedelta(minutes=90))
+    assert ready is False
+    assert "hasn't ended" in reason or "started yet" in reason
+
+
+def test_session_readiness_true_once_the_buffer_elapses(monkeypatch):
+    monkeypatch.setattr(data_mod.fastf1, "get_event_schedule",
+                        lambda year, include_testing: pd.DataFrame([_cota_like_schedule_row()]))
+    # Qualifying: 21:00 start + 60min default duration + 90min buffer = ready at 23:30 UTC.
+    not_yet = pd.Timestamp("2026-10-24T23:00:00Z")
+    ready, _ = session_readiness(not_yet, 2026, "United States Grand Prix", ("Qualifying",),
+                                 pd.Timedelta(minutes=90))
+    assert ready is False
+
+    ready_now = pd.Timestamp("2026-10-24T23:31:00Z")
+    ready, _ = session_readiness(ready_now, 2026, "United States Grand Prix", ("Qualifying",),
+                                 pd.Timedelta(minutes=90))
+    assert ready is True
+
+
+def test_race_has_started_true_only_once_race_session_begins(monkeypatch):
+    monkeypatch.setattr(data_mod.fastf1, "get_event_schedule",
+                        lambda year, include_testing: pd.DataFrame([_cota_like_schedule_row()]))
+    before_race = pd.Timestamp("2026-10-25T19:00:00Z")
+    after_race_start = pd.Timestamp("2026-10-25T20:30:00Z")
+    assert race_has_started(before_race, 2026, "United States Grand Prix") is False
+    assert race_has_started(after_race_start, 2026, "United States Grand Prix") is True
+
+
+def test_race_has_started_fails_safe_when_schedule_unavailable(monkeypatch):
+    """A transient schedule-fetch failure must never let a late prediction
+    be mistaken for "the race hasn't started" -- fail toward True (started)
+    so nothing ever gets backfilled after the fact."""
+    def _boom(*a, **k):
+        raise RuntimeError("no network")
+    monkeypatch.setattr(data_mod.fastf1, "get_event_schedule", _boom)
+    assert race_has_started(pd.Timestamp("2026-10-25T20:30:00Z"), 2026, "United States Grand Prix") is True

@@ -9,13 +9,16 @@ on:
     # pre-weekend quali + race v2 forecast for whatever's coming up next.
     - cron: "0 2 * * 1"
     - cron: "0 14 * * 1"
-    # Saturday 16:00 UTC: FP3 has finished for essentially every race format
-    # by then (sprint weekends have no FP3 -- predict_staged just finds
-    # nothing in that window and no-ops) -- log a post-practice forecast.
-    - cron: "0 16 * * 6"
-    # Saturday 20:00 UTC: qualifying has finished for essentially every race
-    # format by then -- log race-outcome (v1 + v2) and post-quali predictions.
-    - cron: "0 20 * * 6"
+    # Hourly across Saturday and Sunday (every race format's FP3/Qualifying
+    # falls somewhere in this window, including the 2026 US GP's COTA-timed
+    # 21:00-22:00 UTC Qualifying, which a single fixed-time cron missed --
+    # see CLAUDE.md). predict_staged.py/predict_next_race.py are
+    # schedule-aware: each hourly tick checks our own schedule and only
+    # actually predicts once its gating session has genuinely ended (with a
+    # buffer) and that race hasn't been predicted yet, otherwise it's a
+    # clean no-op. This replaces what used to be single fixed-time crons
+    # ("0 16 * * 6" for post-practice, "0 20 * * 6" for post-quali).
+    - cron: "0 * * * 6,0"
   workflow_dispatch: {}
 
 jobs:
@@ -82,15 +85,15 @@ jobs:
         run: .venv/bin/python -m scripts.predict_staged --stage forecast
 
       - name: Post-practice forecast (quali + race v2, after FP3)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 16 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: .venv/bin/python -m scripts.predict_staged --stage post_practice
 
       - name: Predict next race (v1, post-quali)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: .venv/bin/python -m scripts.predict_next_race
 
       - name: Post-quali race predictions (v2)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: .venv/bin/python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
@@ -152,15 +155,15 @@ jobs:
         run: python -m scripts.predict_staged --stage forecast
 
       - name: Post-practice forecast (quali + race v2, after FP3)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 16 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: python -m scripts.predict_staged --stage post_practice
 
       - name: Predict next race (v1, post-quali)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: python -m scripts.predict_next_race
 
       - name: Post-quali race predictions (v2)
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 20 * * 6'
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
         run: python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
