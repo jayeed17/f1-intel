@@ -72,29 +72,29 @@ jobs:
 
       - name: Build missing prebuilt data
         if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
-        run: .venv/bin/python -m scripts.build_prebuilt --year 2026 --only-missing
+        run: ./scripts/retry_once.sh .venv/bin/python -m scripts.build_prebuilt --year 2026 --only-missing
 
       - name: Score predictions
         if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
         run: |
-          .venv/bin/python -m scripts.score_predictions --year 2026
-          .venv/bin/python -m scripts.score_staged --year 2026
+          ./scripts/retry_once.sh .venv/bin/python -m scripts.score_predictions --year 2026
+          ./scripts/retry_once.sh .venv/bin/python -m scripts.score_staged --year 2026
 
       - name: Forecast next race (quali + race v2, pre-weekend)
         if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
-        run: .venv/bin/python -m scripts.predict_staged --stage forecast
+        run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_staged --stage forecast
 
       - name: Post-practice forecast (quali + race v2, after FP3)
         if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
-        run: .venv/bin/python -m scripts.predict_staged --stage post_practice
+        run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_staged --stage post_practice
 
       - name: Predict next race (v1, post-quali)
         if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
-        run: .venv/bin/python -m scripts.predict_next_race
+        run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_next_race
 
       - name: Post-quali race predictions (v2)
         if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 * * * 6,0'
-        run: .venv/bin/python -m scripts.predict_staged --stage post_quali
+        run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
         run: |
