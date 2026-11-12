@@ -1016,7 +1016,99 @@
           ]
         }
       },
-      "built_at": "2026-11-06T08:37:00.706916+00:00"
+      "built_at": "2026-11-12T09:14:57.816717+00:00"
+    },
+    {
+      "year": 2026,
+      "round": 19,
+      "name": "Mexico City Grand Prix",
+      "sessions": [
+        "FP1",
+        "FP2",
+        "FP3",
+        "Q",
+        "R"
+      ],
+      "session_status": {
+        "FP1": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP2": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP3": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "Q": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        },
+        "R": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        }
+      },
+      "built_at": "2026-11-12T09:14:57.816717+00:00"
+    },
+    {
+      "year": 2026,
+      "round": 20,
+      "name": "S\u00e3o Paulo Grand Prix",
+      "sessions": [
+        "FP1",
+        "FP2",
+        "FP3",
+        "Q",
+        "R"
+      ],
+      "session_status": {
+        "FP1": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP2": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP3": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "Q": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        },
+        "R": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        }
+      },
+      "built_at": "2026-11-12T09:14:57.816717+00:00"
     }
   ]
 }
