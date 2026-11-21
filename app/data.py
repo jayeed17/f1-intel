@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -176,13 +177,41 @@ class OpenF1Error(Exception):
     unknown session, or an empty result set)."""
 
 
+_OPENF1_MIN_INTERVAL_S = 0.25  # pace requests so one run doesn't trip its own rate limit
+_OPENF1_MAX_RETRIES = 3
+_openf1_last_call_ts = 0.0
+
+
 def _openf1_get(path: str, timeout: float = 10, **params) -> list[dict]:
-    try:
-        r = requests.get(f"{OPENF1_BASE}/{path}", params=params, timeout=timeout)
-        r.raise_for_status()
+    """GET one OpenF1 endpoint. Paces calls at least _OPENF1_MIN_INTERVAL_S
+    apart (module-wide, across every caller in this process) and retries up
+    to _OPENF1_MAX_RETRIES times on a 429, honoring the Retry-After header
+    when OpenF1 sends one and falling back to a short exponential wait
+    otherwise. Without this, build_prebuilt.py hammering dozens of
+    sessions/drivers back-to-back in one run trips OpenF1's own rate limit
+    and every subsequent call that run fails outright, with no chance to
+    recover before the run ends."""
+    global _openf1_last_call_ts
+    for attempt in range(_OPENF1_MAX_RETRIES + 1):
+        wait = _OPENF1_MIN_INTERVAL_S - (time.monotonic() - _openf1_last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = requests.get(f"{OPENF1_BASE}/{path}", params=params, timeout=timeout)
+        except requests.RequestException as e:
+            raise OpenF1Error(str(e)) from e
+        finally:
+            _openf1_last_call_ts = time.monotonic()
+        if r.status_code == 429 and attempt < _OPENF1_MAX_RETRIES:
+            retry_after = r.headers.get("Retry-After")
+            time.sleep(float(retry_after) if retry_after else 2 ** attempt)
+            continue
+        try:
+            r.raise_for_status()
+        except requests.RequestException as e:
+            raise OpenF1Error(str(e)) from e
         return r.json()
-    except requests.RequestException as e:
-        raise OpenF1Error(str(e)) from e
+    raise OpenF1Error(f"OpenF1 still rate-limited after {_OPENF1_MAX_RETRIES} retries: {path}")
 
 
 def _fastf1_event_date(year: int, gp: str | int) -> pd.Timestamp | None:
