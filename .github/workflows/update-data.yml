@@ -75,13 +75,13 @@ jobs:
         run: ./scripts/retry_once.sh .venv/bin/python -m scripts.build_prebuilt --year 2026 --only-missing
 
       - name: Score predictions
-        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        if: always() && (github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule))
         run: |
           ./scripts/retry_once.sh .venv/bin/python -m scripts.score_predictions --year 2026
           ./scripts/retry_once.sh .venv/bin/python -m scripts.score_staged --year 2026
 
       - name: Forecast next race (quali + race v2, pre-weekend)
-        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        if: always() && (github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule))
         run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_staged --stage forecast
 
       - name: Post-practice forecast (quali + race v2, after FP3)
@@ -97,6 +97,7 @@ jobs:
         run: ./scripts/retry_once.sh .venv/bin/python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -105,7 +106,12 @@ jobs:
             echo "No data changes."
           else
             git commit -m "Update prebuilt race data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-            git push
+            for i in 1 2 3; do
+              git push && break
+              echo "Push rejected -- probably racing the other job's push (self-hosted/fallback can both update the same data). Rebasing onto origin/main and retrying."
+              git fetch origin main
+              git rebase -X theirs origin/main
+            done
           fi
 
   # Only runs if update-self-hosted didn't finish successfully (Mac offline,
@@ -145,13 +151,13 @@ jobs:
         run: python -m scripts.build_prebuilt --year 2026 --only-missing
 
       - name: Score predictions
-        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        if: always() && (github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule))
         run: |
           python -m scripts.score_predictions --year 2026
           python -m scripts.score_staged --year 2026
 
       - name: Forecast next race (quali + race v2, pre-weekend)
-        if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule)
+        if: always() && (github.event_name == 'workflow_dispatch' || contains(fromJSON('["0 2 * * 1", "0 14 * * 1"]'), github.event.schedule))
         run: python -m scripts.predict_staged --stage forecast
 
       - name: Post-practice forecast (quali + race v2, after FP3)
@@ -167,6 +173,7 @@ jobs:
         run: python -m scripts.predict_staged --stage post_quali
 
       - name: Commit and push if data changed
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -175,5 +182,10 @@ jobs:
             echo "No data changes."
           else
             git commit -m "Update prebuilt race data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-            git push
+            for i in 1 2 3; do
+              git push && break
+              echo "Push rejected -- probably racing the other job's push (self-hosted/fallback can both update the same data). Rebasing onto origin/main and retrying."
+              git fetch origin main
+              git rebase -X theirs origin/main
+            done
           fi
