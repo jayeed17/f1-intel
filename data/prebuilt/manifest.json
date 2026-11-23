@@ -1016,7 +1016,7 @@
           ]
         }
       },
-      "built_at": "2026-11-12T09:14:57.816717+00:00"
+      "built_at": "2026-11-23T10:33:30.360527+00:00"
     },
     {
       "year": 2026,
@@ -1062,7 +1062,7 @@
           ]
         }
       },
-      "built_at": "2026-11-12T09:14:57.816717+00:00"
+      "built_at": "2026-11-23T10:33:30.360527+00:00"
     },
     {
       "year": 2026,
@@ -1108,7 +1108,53 @@
           ]
         }
       },
-      "built_at": "2026-11-12T09:14:57.816717+00:00"
+      "built_at": "2026-11-23T10:13:05.700633+00:00"
+    },
+    {
+      "year": 2026,
+      "round": 21,
+      "name": "Las Vegas Grand Prix",
+      "sessions": [
+        "FP1",
+        "FP2",
+        "FP3",
+        "Q",
+        "R"
+      ],
+      "session_status": {
+        "FP1": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP2": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "FP3": {
+          "source": "openf1",
+          "status": "complete",
+          "missing": []
+        },
+        "Q": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        },
+        "R": {
+          "source": "openf1",
+          "status": "partial",
+          "missing": [
+            "telemetry",
+            "corners"
+          ]
+        }
+      },
+      "built_at": "2026-11-23T10:13:05.700633+00:00"
     }
   ]
 }
